@@ -4,19 +4,18 @@ import { getCustomerSocket, resetCustomerSocket } from '../lib/socket.js';
 import ChatWindow from '../components/ChatWindow.jsx';
 import CallWidget from '../components/CallWidget.jsx';
 
-const SESSION_KEY = 'esk_session';
+const SESSION_KEY = 'esk_customer_session';
 const CUSTOMER_KEY = 'esk_customer';
 
 function loadStored() {
   try {
-    const s = localStorage.getItem(SESSION_KEY);
-    const c = localStorage.getItem(CUSTOMER_KEY);
-    return {
-      sessionId: s || '',
-      customer: c ? JSON.parse(c) : null,
-    };
+    const token = localStorage.getItem(SESSION_KEY);
+    const rawCustomer = localStorage.getItem(CUSTOMER_KEY);
+    const customer = rawCustomer ? JSON.parse(rawCustomer) : null;
+    if (!token || !customer?.conversationId) return { customerToken: '', customer: null };
+    return { customerToken: token, customer };
   } catch {
-    return { sessionId: '', customer: null };
+    return { customerToken: '', customer: null };
   }
 }
 
@@ -36,17 +35,10 @@ export default function CustomerApp() {
   // Bind socket when chat starts
   useEffect(() => {
     if (!started || !session.customer) return;
-    const sock = getCustomerSocket({
-      customerId: session.customer.customerId,
-      conversationId: session.customer.conversationId,
-      name: session.customer.name,
-      sessionId: session.sessionId,
-    });
+    const sock = getCustomerSocket({ token: session.customerToken });
     socketRef.current = sock;
     sock.emit('customer:bind', {
-      customerId: session.customer.customerId,
       conversationId: session.customer.conversationId,
-      name: session.customer.name,
     });
 
     sock.on('conversation:messages', (msgs) => setMessages(msgs));
@@ -95,15 +87,17 @@ export default function CustomerApp() {
       const res = await api.post('/api/customer/start', {
         name: name.trim(),
         requirement: requirement.trim(),
-        sessionId: session.sessionId || undefined,
+        customerToken: session.customerToken || undefined,
       });
-      localStorage.setItem(SESSION_KEY, res.sessionId);
+      localStorage.setItem(SESSION_KEY, res.customerToken);
       localStorage.setItem(CUSTOMER_KEY, JSON.stringify({
-        customerId: res.customerId,
         conversationId: res.conversationId,
-        name: name.trim(),
+        name: res.customerName || name.trim(),
       }));
-      setSession({ sessionId: res.sessionId, customer: { customerId: res.customerId, conversationId: res.conversationId, name: name.trim() } });
+      setSession({
+        customerToken: res.customerToken,
+        customer: { conversationId: res.conversationId, name: res.customerName || name.trim() },
+      });
       setStarted(true);
       setStatus(res.status);
     } catch (e) {
@@ -151,7 +145,7 @@ export default function CustomerApp() {
     setMessages([]);
     setStatus('AI_ACTIVE');
     setAgentName(null);
-    setSession({ sessionId: '', customer: null });
+    setSession({ customerToken: '', customer: null });
     setCallInfo(null);
   }
 

@@ -12,6 +12,13 @@ import { z } from 'zod';
 
 import { initDb, run, get, all } from './db.js';
 import { signToken, verifyToken, comparePassword, requireAuth, requireRole, hashPassword } from './auth.js';
+import {
+  authenticateCustomerSession,
+  createCustomerSessionToken,
+  customerOwnsConversation,
+  customerTokenFromRequest,
+  hashCustomerSessionToken,
+} from './customer-auth.js';
 import { generateReply, suggestReply } from './ai.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -200,71 +207,90 @@ app.get('/api/agents', requireAuth, requireRole('owner'), (req, res) => {
 // =====================================================
 // Customer REST (public)
 // =====================================================
-// Start a new customer session or resume existing by sessionId
+// Start a new customer session or resume one by presenting its opaque secret.
+// Browser-supplied customer/conversation identifiers are never accepted here.
 app.post('/api/customer/start', (req, res) => {
   const schema = z.object({
-    name: z.string().min(1).max(80),
-    requirement: z.string().min(1).max(500),
-    sessionId: z.string().optional(),
+    name: z.string().trim().min(1).max(80),
+    requirement: z.string().trim().min(1).max(500),
+    customerToken: z.string().max(256).optional(),
   });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Please provide your name and your question.' });
   const { name, requirement } = parsed.data;
-  let sessionId = sanitize(req.body.sessionId || '');
-  if (!sessionId) sessionId = 'sess_' + nanoid(24);
 
-  // Find or create customer by sessionId
-  let customer = get('SELECT * FROM customers WHERE session_id = ?', [sessionId]);
-  if (!customer) {
-    const id = 'cu_' + nanoid(12);
-    run('INSERT INTO customers (id,name,session_id,requirement,created_at,last_active_at) VALUES (?,?,?,?,?,?)',
-      [id, sanitize(name, 80), sessionId, sanitize(requirement, 500), now(), now()]);
-    customer = get('SELECT * FROM customers WHERE id = ?', [id]);
-  } else {
-    run('UPDATE customers SET name = ?, requirement = COALESCE(?, requirement), last_active_at = ? WHERE id = ?',
-      [sanitize(name, 80), sanitize(requirement, 500), now(), customer.id]);
+  let customerToken = parsed.data.customerToken || '';
+  let customer = customerToken ? authenticateCustomerSession(customerToken) : null;
+  if (customerToken && !customer) {
+    return res.status(401).json({ error: 'Customer session is invalid or expired. Start a new chat.' });
   }
 
-  // Find an open conversation for this customer, or create one
+  if (!customer) {
+    const id = 'cu_' + nanoid(12);
+    const sessionId = 'sess_' + nanoid(24); // non-secret internal correlation id
+    customerToken = createCustomerSessionToken();
+    const tokenHash = hashCustomerSessionToken(customerToken);
+    run(
+      'INSERT INTO customers (id,name,session_id,session_token_hash,requirement,created_at,last_active_at) VALUES (?,?,?,?,?,?,?)',
+      [id, sanitize(name, 80), sessionId, tokenHash, sanitize(requirement, 500), now(), now()],
+    );
+    customer = get('SELECT * FROM customers WHERE id = ?', [id]);
+  } else {
+    run(
+      'UPDATE customers SET name = ?, requirement = ?, last_active_at = ? WHERE id = ?',
+      [sanitize(name, 80), sanitize(requirement, 500), now(), customer.id],
+    );
+    customer = get('SELECT * FROM customers WHERE id = ?', [customer.id]);
+  }
+
+  // Find an open conversation for this verified customer, or create one.
   let convo = get("SELECT * FROM conversations WHERE customer_id = ? AND status != 'CLOSED' ORDER BY updated_at DESC LIMIT 1", [customer.id]);
   if (!convo) {
     const id = 'co_' + nanoid(12);
     run('INSERT INTO conversations (id,customer_id,status,mode,created_at,updated_at) VALUES (?,?,?,?,?,?)',
       [id, customer.id, 'AI_ACTIVE', 'ai', now(), now()]);
-    // Welcome message
     const welcomeId = 'm_' + nanoid(12);
     run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
       [welcomeId, id, 'SYSTEM', null, 'You are now chatting with Electricalskart Support. AI assistant is online — type your question or click "Call Now" to speak with a person.', now()]);
-    // Also record the customer's initial requirement as a customer message so the AI sees it.
     if (customer.requirement) {
       const reqId = 'm_' + nanoid(12);
       run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
         [reqId, id, 'CUSTOMER', customer.id, customer.requirement, now()]);
     }
     convo = get('SELECT * FROM conversations WHERE id = ?', [id]);
-    // Asynchronously kick off AI reply after a tiny delay
     setTimeout(() => generateAIResponseAndPersist(id, customer.id), 400);
   }
 
   res.json({
-    sessionId,
-    customerId: customer.id,
+    customerToken,
     conversationId: convo.id,
+    customerName: customer.name,
     status: convo.status,
   });
 });
 
-// Public endpoint to fetch conversation messages (authenticated by conversationId + sessionId stored in memory on socket; for REST: just conversationId — sufficient since it's a random id and customer has no account)
+// Conversation history is available to authenticated staff or to the verified
+// customer session that owns the requested conversation.
 app.get('/api/conversations/:id/messages', (req, res) => {
   const convId = req.params.id;
   const conv = get('SELECT * FROM conversations WHERE id = ?', [convId]);
   if (!conv) return res.status(404).json({ error: 'Not found' });
+
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const staff = bearer ? verifyToken(bearer) : null;
+  const customer = authenticateCustomerSession(customerTokenFromRequest(req));
+  const staffAllowed = staff && ['owner', 'agent'].includes(staff.role);
+  const customerAllowed = customer && conv.customer_id === customer.id;
+  if (!staffAllowed && !customerAllowed) {
+    return res.status(customer || staff ? 403 : 401).json({ error: 'Not authorized for this conversation' });
+  }
+
   const msgs = all(
     'SELECT id, sender_type as senderType, sender_id as senderId, message, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
-    [convId]
+    [convId],
   );
-  const customer = get('SELECT name, requirement FROM customers WHERE id = ?', [conv.customer_id]);
-  res.json({ conversation: conv, customer, messages: msgs });
+  const conversationCustomer = get('SELECT name, requirement FROM customers WHERE id = ?', [conv.customer_id]);
+  res.json({ conversation: conv, customer: conversationCustomer, messages: msgs });
 });
 
 // =====================================================
@@ -322,18 +348,21 @@ io.use((socket, next) => {
   if (role === 'agent') {
     if (!token) return next(new Error('Authentication required'));
     const payload = verifyToken(token);
-    if (!payload) return next(new Error('Invalid token'));
+    if (!payload || !['owner', 'agent'].includes(payload.role)) return next(new Error('Invalid token'));
     socket.data.user = payload;
-  } else {
-    // customer — attach session/customer/conversation ids if provided
-    socket.data.customer = {
-      customerId: socket.handshake.auth?.customerId || null,
-      conversationId: socket.handshake.auth?.conversationId || null,
-      sessionId: socket.handshake.auth?.sessionId || null,
-      name: socket.handshake.auth?.name || null,
-    };
+    return next();
   }
-  next();
+  if (role === 'customer') {
+    const customer = authenticateCustomerSession(token);
+    if (!customer) return next(new Error('Invalid customer session'));
+    // Identity comes exclusively from the verified opaque session token.
+    socket.data.customer = {
+      customerId: customer.id,
+      name: customer.name,
+    };
+    return next();
+  }
+  return next(new Error('Unknown connection role'));
 });
 
 io.on('connection', (socket) => {
@@ -487,56 +516,83 @@ io.on('connection', (socket) => {
     });
   } else {
     // ---------- CUSTOMER ----------
-    socket.join('customers');
-    const c = socket.data.customer || {};
-    if (c.customerId && c.conversationId) {
-      customers.set(socket.id, {
-        customerId: c.customerId,
-        conversationId: c.conversationId,
-        name: c.name,
-      });
-      run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), c.customerId]);
-    }
+    // The middleware has already derived this identity from the opaque session
+    // token. A socket receives no conversation events until a verified bind.
+    const verifiedCustomer = socket.data.customer;
 
-    socket.on('customer:bind', ({ customerId, conversationId, name }) => {
-      customers.set(socket.id, { customerId, conversationId, name });
-      run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), customerId]);
-      // Push current status
-      const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
-      if (conv) socket.emit('conversation:status', { status: conv.status });
+    socket.on('customer:bind', (payload, ack) => {
+      const parsed = z.object({ conversationId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) {
+        const error = { code: 'INVALID_REQUEST', message: 'Invalid conversation request' };
+        socket.emit('customer:error', error);
+        return ack?.({ ok: false, error });
+      }
+      const { conversationId } = parsed.data;
+      const conv = customerOwnsConversation(verifiedCustomer.customerId, conversationId);
+      if (!conv) {
+        const error = { code: 'FORBIDDEN', message: 'Conversation does not belong to this customer session' };
+        socket.emit('customer:error', error);
+        return ack?.({ ok: false, error });
+      }
+
+      const previous = customers.get(socket.id);
+      if (previous?.conversationId) socket.leave(`customer-conversation:${previous.conversationId}`);
+      customers.set(socket.id, {
+        customerId: verifiedCustomer.customerId,
+        conversationId,
+        name: verifiedCustomer.name,
+      });
+      socket.join(`customer-conversation:${conversationId}`);
+      run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), verifiedCustomer.customerId]);
+      socket.emit('conversation:status', { status: conv.status });
       const msgs = all(
         'SELECT id, sender_type as senderType, sender_id as senderId, message, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
-        [conversationId]
+        [conversationId],
       );
       socket.emit('conversation:messages', msgs);
+      return ack?.({ ok: true, conversationId });
     });
 
-    socket.on('customer:message', async ({ conversationId, message }) => {
-      const text = sanitize(message);
-      if (!text) return;
+    socket.on('customer:message', (payload, ack) => {
+      const parsed = z.object({
+        conversationId: z.string().min(1).max(100),
+        message: z.string().trim().min(1).max(2000),
+      }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: { code: 'INVALID_REQUEST' } });
+      const { conversationId, message } = parsed.data;
       const cdata = customers.get(socket.id);
-      if (!cdata || cdata.conversationId !== conversationId) return;
-      run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), cdata.customerId]);
-      const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
-      if (!conv) return;
+      const conv = customerOwnsConversation(verifiedCustomer.customerId, conversationId);
+      if (!cdata || cdata.conversationId !== conversationId || !conv) {
+        const error = { code: 'FORBIDDEN', message: 'Conversation does not belong to this customer session' };
+        socket.emit('customer:error', error);
+        return ack?.({ ok: false, error });
+      }
+
+      const text = sanitize(message);
+      run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), verifiedCustomer.customerId]);
       run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now(), conversationId]);
       const id = 'm_' + nanoid(12);
       run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
-        [id, conversationId, 'CUSTOMER', cdata.customerId, text, now()]);
+        [id, conversationId, 'CUSTOMER', verifiedCustomer.customerId, text, now()]);
       pushMessagesToConversation(conversationId);
       broadcastDashboard();
+      ack?.({ ok: true, messageId: id });
 
-      // If in AI mode, let AI reply
       if (conv.status === 'AI_ACTIVE') {
-        setTimeout(() => generateAIResponseAndPersist(conversationId, cdata.customerId), 100);
+        setTimeout(() => generateAIResponseAndPersist(conversationId, verifiedCustomer.customerId), 100);
       }
-      // If in HUMAN_REQUIRED or HUMAN_ACTIVE, agents see it via broadcast.
     });
 
     // ---------- Customer initiates call ----------
-    socket.on('call:request', ({ conversationId }) => {
+    socket.on('call:request', (payload) => {
+      const parsed = z.object({ conversationId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) return socket.emit('call:error', { message: 'Invalid call request.' });
+      const { conversationId } = parsed.data;
       const cdata = customers.get(socket.id);
-      if (!cdata) return;
+      const ownedConversation = customerOwnsConversation(verifiedCustomer.customerId, conversationId);
+      if (!cdata || cdata.conversationId !== conversationId || !ownedConversation) {
+        return socket.emit('call:error', { message: 'Not authorized for this conversation.' });
+      }
       // Prevent duplicate active/waiting calls for this customer
       const existing = get(
         "SELECT * FROM calls WHERE customer_id = ? AND status IN ('ringing','in_queue','active') LIMIT 1",

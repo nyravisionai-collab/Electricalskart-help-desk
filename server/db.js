@@ -40,11 +40,20 @@ async function initDb() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       session_id TEXT NOT NULL UNIQUE,
+      session_token_hash TEXT,
       requirement TEXT,
       created_at INTEGER NOT NULL,
       last_active_at INTEGER NOT NULL
     );
   `);
+  // Existing prototype databases predate authenticated customer sessions.
+  // Keep their records, but require those customers to start a fresh verified
+  // session before they can access a conversation again.
+  const customerColumns = db.exec('PRAGMA table_info(customers)')[0]?.values.map(row => row[1]) || [];
+  if (!customerColumns.includes('session_token_hash')) {
+    db.run('ALTER TABLE customers ADD COLUMN session_token_hash TEXT;');
+  }
+  db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_session_token ON customers(session_token_hash);');
   db.run(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
