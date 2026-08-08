@@ -83,24 +83,79 @@ async function initDb() {
       FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     );
   `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS calls (
+  const createCallsTable = tableName => `
+    CREATE TABLE ${tableName} (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       conversation_id TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ringing','in_queue','active','ended','rejected','missed','cancelled')),
-      queue_position INTEGER DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'WAITING'
+        CHECK(status IN ('WAITING','RINGING','ACTIVE','REJECTED','CANCELLED','ENDED','FAILED','MISSED')),
+      queue_position INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
+      ringing_at INTEGER,
       answered_at INTEGER,
       ended_at INTEGER,
-      duration INTEGER DEFAULT 0,
+      duration INTEGER NOT NULL DEFAULT 0,
       handled_by TEXT,
       end_reason TEXT,
+      previous_conversation_status TEXT NOT NULL,
+      previous_conversation_mode TEXT NOT NULL,
+      expires_at INTEGER,
+      updated_at INTEGER NOT NULL,
       FOREIGN KEY(customer_id) REFERENCES customers(id),
       FOREIGN KEY(conversation_id) REFERENCES conversations(id),
       FOREIGN KEY(handled_by) REFERENCES users(id)
     );
-  `);
+  `;
+  const callsTable = db.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'calls'")[0];
+  if (!callsTable) {
+    db.run(createCallsTable('calls'));
+  } else {
+    const callColumns = db.exec('PRAGMA table_info(calls)')[0]?.values.map(row => row[1]) || [];
+    const callsSql = String(callsTable.values[0]?.[0] || '');
+    const needsCallMigration = !callColumns.includes('previous_conversation_status') || callsSql.includes("'pending'");
+    if (needsCallMigration) {
+      db.run('PRAGMA foreign_keys = OFF;');
+      db.run('DROP TABLE IF EXISTS calls_m9;');
+      db.run(createCallsTable('calls_m9'));
+      db.run(`
+        INSERT INTO calls_m9 (
+          id, customer_id, conversation_id, status, queue_position, started_at,
+          ringing_at, answered_at, ended_at, duration, handled_by, end_reason,
+          previous_conversation_status, previous_conversation_mode, expires_at, updated_at
+        )
+        SELECT
+          ca.id, ca.customer_id, ca.conversation_id,
+          CASE ca.status
+            WHEN 'pending' THEN 'WAITING'
+            WHEN 'in_queue' THEN 'WAITING'
+            WHEN 'ringing' THEN 'RINGING'
+            WHEN 'active' THEN 'ACTIVE'
+            WHEN 'ended' THEN 'ENDED'
+            WHEN 'rejected' THEN 'REJECTED'
+            WHEN 'missed' THEN 'MISSED'
+            WHEN 'cancelled' THEN 'CANCELLED'
+            ELSE 'FAILED'
+          END,
+          COALESCE(ca.queue_position, 0), ca.started_at,
+          CASE WHEN ca.status = 'ringing' THEN ca.started_at ELSE NULL END,
+          ca.answered_at, ca.ended_at, COALESCE(ca.duration, 0), ca.handled_by, ca.end_reason,
+          CASE
+            WHEN co.status IN ('AI_ACTIVE','HUMAN_REQUIRED','HUMAN_ACTIVE') THEN co.status
+            WHEN co.assigned_agent_id IS NOT NULL THEN 'HUMAN_ACTIVE'
+            ELSE 'AI_ACTIVE'
+          END,
+          CASE WHEN co.mode = 'human' THEN 'human' ELSE 'ai' END,
+          ca.started_at + 900000,
+          COALESCE(ca.ended_at, ca.answered_at, ca.started_at)
+        FROM calls ca
+        JOIN conversations co ON co.id = ca.conversation_id;
+      `);
+      db.run('DROP TABLE calls;');
+      db.run('ALTER TABLE calls_m9 RENAME TO calls;');
+      db.run('PRAGMA foreign_keys = ON;');
+    }
+  }
   db.run(`
     CREATE TABLE IF NOT EXISTS knowledge_entries (
       id TEXT PRIMARY KEY,

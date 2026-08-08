@@ -44,8 +44,18 @@ export default function Dashboard({ onLogout }) {
     });
     sock.on('call:queue_update', (q) => setQueue(q));
     sock.on('call:accepted', ({ callId, customerSocketId }) => {
+      setActiveCall({ callId, peerSocketId: customerSocketId });
+      setIncomingCall(null);
+      incomingRef.current = null;
+    });
+    sock.on('call:taken', ({ callId }) => {
       if (incomingRef.current?.callId === callId) {
-        setActiveCall({ callId, peerSocketId: customerSocketId });
+        setIncomingCall(null);
+        incomingRef.current = null;
+      }
+    });
+    sock.on('call:resolved', ({ callId }) => {
+      if (incomingRef.current?.callId === callId) {
         setIncomingCall(null);
         incomingRef.current = null;
       }
@@ -69,6 +79,8 @@ export default function Dashboard({ onLogout }) {
       sock.off('call:incoming');
       sock.off('call:queue_update');
       sock.off('call:accepted');
+      sock.off('call:taken');
+      sock.off('call:resolved');
       sock.off('call:rejected');
       sock.off('call:ended');
       sock.off('agents:presence');

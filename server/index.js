@@ -83,14 +83,38 @@ app.use('/api/', rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, 
 app.use('/api/auth/login', rateLimit({ windowMs: 60_000, max: 10, standardHeaders: true, legacyHeaders: false }));
 
 // =====================================================
-// In-memory state (call queue, active sockets)
+// Connected peers are ephemeral; call and queue state is database-backed.
 // =====================================================
-const customers = new Map();       // socketId -> { customerId, conversationId }
-const agents = new Map();          // socketId -> { userId, role, name }
-const callState = {
-  currentCall: null,               // { callId, customerSocketId, agentSocketId, startedAt }
-  queue: [],                       // [{ callId, customerId, conversationId, customerName, customerSocketId, enqueuedAt }]
-  ringing: null,                   // { callId, customerSocketId, timeout }
+const customers = new Map(); // socketId -> verified { customerId, conversationId, name }
+const agents = new Map();    // socketId -> verified { userId, role, name }
+
+const CALL_STATUS = Object.freeze({
+  WAITING: 'WAITING',
+  RINGING: 'RINGING',
+  ACTIVE: 'ACTIVE',
+  REJECTED: 'REJECTED',
+  CANCELLED: 'CANCELLED',
+  ENDED: 'ENDED',
+  FAILED: 'FAILED',
+  MISSED: 'MISSED',
+});
+const TERMINAL_CALL_STATUSES = new Set([
+  CALL_STATUS.REJECTED,
+  CALL_STATUS.CANCELLED,
+  CALL_STATUS.ENDED,
+  CALL_STATUS.FAILED,
+  CALL_STATUS.MISSED,
+]);
+const CALL_TRANSITIONS = Object.freeze({
+  [CALL_STATUS.WAITING]: new Set([CALL_STATUS.RINGING, CALL_STATUS.CANCELLED, CALL_STATUS.FAILED, CALL_STATUS.MISSED]),
+  [CALL_STATUS.RINGING]: new Set([CALL_STATUS.ACTIVE, CALL_STATUS.REJECTED, CALL_STATUS.CANCELLED, CALL_STATUS.FAILED, CALL_STATUS.MISSED]),
+  [CALL_STATUS.ACTIVE]: new Set([CALL_STATUS.ENDED, CALL_STATUS.FAILED]),
+});
+const CALL_RING_TIMEOUT_MS = Math.max(250, Number.parseInt(process.env.CALL_RING_TIMEOUT_MS || '30000', 10));
+const CALL_QUEUE_TTL_MS = Math.max(5_000, Number.parseInt(process.env.CALL_QUEUE_TTL_MS || '900000', 10));
+const callRuntime = {
+  ringingTimers: new Map(), // callId -> timeout
+  peers: new Map(),         // callId -> { customerSocketId, agentSocketId }
 };
 
 // =====================================================
@@ -121,18 +145,30 @@ function buildDashboardSummary() {
      WHERE c.status != 'CLOSED'
      ORDER BY c.updated_at DESC`
   );
-  const activeCalls = all(`SELECT * FROM calls WHERE status IN ('ringing','in_queue','active') ORDER BY started_at ASC`);
+  const activeCalls = all(`
+    SELECT ca.*, cu.name AS customer_name, cu.requirement
+    FROM calls ca JOIN customers cu ON cu.id = ca.customer_id
+    WHERE ca.status IN ('WAITING','RINGING','ACTIVE')
+    ORDER BY CASE ca.status WHEN 'ACTIVE' THEN 0 WHEN 'RINGING' THEN 1 ELSE 2 END,
+             ca.queue_position ASC, ca.started_at ASC
+  `);
   const stats = {
     total_conversations: (all('SELECT COUNT(*) as c FROM conversations')[0]?.c) || 0,
-    total_calls: (all("SELECT COUNT(*) as c FROM calls WHERE status IN ('active','ended')")[0]?.c) || 0,
+    total_calls: (all('SELECT COUNT(*) as c FROM calls')[0]?.c) || 0,
     active_customers: active.length,
     ai_conversations: active.filter(c => c.status === 'AI_ACTIVE').length,
     human_required: active.filter(c => c.status === 'HUMAN_REQUIRED').length,
     human_active: active.filter(c => c.status === 'HUMAN_ACTIVE').length,
-    active_calls: activeCalls.filter(c => c.status === 'active').length,
-    waiting_calls: activeCalls.filter(c => c.status === 'in_queue').length,
+    active_calls: activeCalls.filter(call => call.status === CALL_STATUS.ACTIVE).length,
+    waiting_calls: activeCalls.filter(call => call.status === CALL_STATUS.WAITING).length,
   };
-  return { conversations: active, calls: activeCalls, stats, queue: callState.queue.length, currentCall: !!callState.currentCall };
+  return {
+    conversations: active,
+    calls: activeCalls,
+    stats,
+    queue: activeCalls.filter(call => call.status === CALL_STATUS.WAITING).length,
+    currentCall: activeCalls.some(call => call.status === CALL_STATUS.ACTIVE),
+  };
 }
 
 function pushMessagesToConversation(conversationId) {
@@ -451,6 +487,7 @@ io.on('connection', (socket) => {
     socket.emit('auth:ok', { user: u });
     socket.emit('dashboard:update', buildDashboardSummary());
     io.to('agents').emit('agents:presence', [...agents.values()]);
+    promoteNextWaitingCall();
 
     socket.on('conversation:open', ({ conversationId }) => {
       const msgs = all(
@@ -463,6 +500,10 @@ io.on('connection', (socket) => {
     socket.on('conversation:takeover', ({ conversationId }) => {
       const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
       if (!conv) return;
+      run(
+        "UPDATE calls SET previous_conversation_status = 'HUMAN_ACTIVE', previous_conversation_mode = 'human', updated_at = ? WHERE conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE')",
+        [now(), conversationId],
+      );
       run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
         [u.uid, now(), conversationId]);
       const sysId = 'm_' + nanoid(12);
@@ -499,6 +540,10 @@ io.on('connection', (socket) => {
       if (!conv) return;
       // If in AI mode, auto-takeover on first agent message
       if (conv.status !== 'HUMAN_ACTIVE') {
+        run(
+          "UPDATE calls SET previous_conversation_status = 'HUMAN_ACTIVE', previous_conversation_mode = 'human', updated_at = ? WHERE conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE')",
+          [now(), conversationId],
+        );
         run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
           [u.uid, now(), conversationId]);
       } else {
@@ -529,67 +574,85 @@ io.on('connection', (socket) => {
     });
 
     // ---------- Call handling (agent side) ----------
-    socket.on('call:accept', ({ callId }) => {
-      if (!callState.ringing || callState.ringing.callId !== callId) return;
-      // Cannot accept if already in a call
-      if (callState.currentCall) return;
-      const call = get('SELECT * FROM calls WHERE id = ?', [callId]);
-      if (!call) return;
-      clearTimeout(callState.ringing.timeout);
-      const customerSid = callState.ringing.customerSocketId;
-      run("UPDATE calls SET status = 'active', answered_at = ?, handled_by = ? WHERE id = ?",
-        [now(), u.uid, callId]);
-      // Update conversation status
-      run("UPDATE conversations SET status = 'IN_CALL', updated_at = ? WHERE id = ?", [now(), call.conversation_id]);
-      callState.currentCall = { callId, customerSocketId: customerSid, agentSocketId: socket.id, startedAt: now() };
-      callState.ringing = null;
-      // Tell customer the call is accepted (WebRTC signaling will start)
-      io.to(customerSid).emit('call:accepted', { callId, agentSocketId: socket.id });
-      socket.emit('call:accepted', { callId, customerSocketId: customerSid });
-      // Kick next waiting caller into ringing
-      promoteQueueToRinging();
+    socket.on('call:accept', (payload, ack) => {
+      const parsed = z.object({ callId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { callId } = parsed.data;
+      const call = getCall(callId);
+      if (!call || call.status !== CALL_STATUS.RINGING) {
+        socket.emit('call:taken', { callId });
+        return ack?.({ ok: false, error: 'CALL_NOT_RINGING' });
+      }
+      if (get("SELECT id FROM calls WHERE status = 'ACTIVE' LIMIT 1")) {
+        return ack?.({ ok: false, error: 'ANOTHER_CALL_ACTIVE' });
+      }
+      const customerSocketId = connectedCustomerSocket(call.customer_id, call.conversation_id);
+      if (!customerSocketId) {
+        completeCall(callId, CALL_STATUS.FAILED, 'customer_unavailable', 'call:ended');
+        return ack?.({ ok: false, error: 'CUSTOMER_UNAVAILABLE' });
+      }
+
+      const acceptedAt = now();
+      const transitioned = transitionCall(callId, CALL_STATUS.ACTIVE, {
+        answered_at: acceptedAt,
+        handled_by: u.uid,
+        expires_at: null,
+      });
+      if (!transitioned.ok) return ack?.({ ok: false, error: transitioned.error });
+      clearRingingTimer(callId);
+      run(
+        "UPDATE conversations SET status = 'IN_CALL', revision = revision + 1, updated_at = ? WHERE id = ?",
+        [acceptedAt, call.conversation_id],
+      );
+      emitConversationStatus(call.conversation_id, 'IN_CALL');
+      callRuntime.peers.set(callId, { customerSocketId, agentSocketId: socket.id });
+
+      io.to('agents').emit('call:taken', { callId, handledBy: u.uid, handledByName: u.name });
+      io.to(customerSocketId).emit('call:accepted', { callId, agentSocketId: socket.id });
+      socket.emit('call:accepted', { callId, customerSocketId });
+      ack?.({ ok: true, callId, customerSocketId });
       broadcastDashboard();
     });
 
-    socket.on('call:reject', ({ callId }) => {
-      if (!callState.ringing || callState.ringing.callId !== callId) return;
-      clearTimeout(callState.ringing.timeout);
-      const customerSid = callState.ringing.customerSocketId;
-      run("UPDATE calls SET status = 'missed', ended_at = ?, end_reason = 'rejected' WHERE id = ?", [now(), callId]);
-      io.to(customerSid).emit('call:rejected', { callId });
-      callState.ringing = null;
-      promoteQueueToRinging();
-      broadcastDashboard();
+    socket.on('call:reject', (payload, ack) => {
+      const parsed = z.object({ callId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const call = getCall(parsed.data.callId);
+      if (!call || call.status !== CALL_STATUS.RINGING) {
+        return ack?.({ ok: false, error: 'CALL_NOT_RINGING' });
+      }
+      const result = completeCall(call.id, CALL_STATUS.REJECTED, 'agent_rejected', 'call:rejected');
+      ack?.({ ok: result.ok, error: result.error });
     });
 
-    socket.on('call:hangup', ({ callId }) => {
-      endCall(callId, 'agent_hangup');
+    socket.on('call:hangup', (payload, ack) => {
+      const parsed = z.object({ callId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const call = getCall(parsed.data.callId);
+      const peers = callRuntime.peers.get(parsed.data.callId);
+      if (!call || call.status !== CALL_STATUS.ACTIVE || call.handled_by !== u.uid || peers?.agentSocketId !== socket.id) {
+        return ack?.({ ok: false, error: 'NOT_CALL_OWNER' });
+      }
+      const result = completeCall(call.id, CALL_STATUS.ENDED, 'agent_hangup');
+      ack?.({ ok: result.ok, error: result.error });
     });
 
-    // WebRTC signaling (authenticated agent) — only forward between connected call peers
-    socket.on('webrtc:signal', ({ to, signal }) => {
-      if (callState.currentCall && callState.currentCall.agentSocketId === socket.id && to === callState.currentCall.customerSocketId) {
-        io.to(to).emit('webrtc:signal', { from: socket.id, signal });
+    // WebRTC signaling is relayed only between the two verified active-call peers.
+    socket.on('webrtc:signal', (payload) => {
+      const parsed = z.object({ to: z.string(), signal: z.unknown() }).safeParse(payload);
+      if (!parsed.success) return;
+      const peer = [...callRuntime.peers.values()].find(value => value.agentSocketId === socket.id);
+      if (peer && parsed.data.to === peer.customerSocketId) {
+        io.to(parsed.data.to).emit('webrtc:signal', { from: socket.id, signal: parsed.data.signal });
       }
     });
 
     socket.on('disconnect', () => {
       agents.delete(socket.id);
       io.to('agents').emit('agents:presence', [...agents.values()]);
-      // If agent was on a call, end it
-      if (callState.currentCall && callState.currentCall.agentSocketId === socket.id) {
-        endCall(callState.currentCall.callId, 'agent_disconnected');
-      }
-      if (callState.ringing) {
-        // Route ringing to other agents? Simplest: miss the call and try queue.
-        clearTimeout(callState.ringing.timeout);
-        const customerSid = callState.ringing.customerSocketId;
-        const callId = callState.ringing.callId;
-        run("UPDATE calls SET status = 'missed', ended_at = ?, end_reason = 'no_agent' WHERE id = ?", [now(), callId]);
-        io.to(customerSid).emit('call:rejected', { callId, reason: 'No agent available' });
-        callState.ringing = null;
-        promoteQueueToRinging();
-      }
+      const ownedCall = [...callRuntime.peers.entries()].find(([, peers]) => peers.agentSocketId === socket.id);
+      if (ownedCall) completeCall(ownedCall[0], CALL_STATUS.FAILED, 'agent_disconnected');
+      // An unrelated agent disconnecting never changes an unclaimed ringing call.
       broadcastDashboard();
     });
   } else {
@@ -628,7 +691,18 @@ io.on('connection', (socket) => {
         [conversationId],
       );
       socket.emit('conversation:messages', msgs);
-      return ack?.({ ok: true, conversationId });
+      const existingCall = get(
+        "SELECT * FROM calls WHERE customer_id = ? AND conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE') ORDER BY started_at DESC LIMIT 1",
+        [verifiedCustomer.customerId, conversationId],
+      );
+      if (existingCall?.status === CALL_STATUS.WAITING) {
+        socket.emit('call:queued', { callId: existingCall.id, position: existingCall.queue_position });
+      } else if (existingCall?.status === CALL_STATUS.RINGING) {
+        socket.emit('call:ringing', { callId: existingCall.id });
+      }
+      ack?.({ ok: true, conversationId });
+      promoteNextWaitingCall();
+      return;
     });
 
     socket.on('customer:message', (payload, ack) => {
@@ -666,193 +740,317 @@ io.on('connection', (socket) => {
     });
 
     // ---------- Customer initiates call ----------
-    socket.on('call:request', (payload) => {
+    socket.on('call:request', (payload, ack) => {
       const parsed = z.object({ conversationId: z.string().min(1).max(100) }).safeParse(payload);
-      if (!parsed.success) return socket.emit('call:error', { message: 'Invalid call request.' });
-      const { conversationId } = parsed.data;
-      const cdata = customers.get(socket.id);
-      const ownedConversation = customerOwnsConversation(verifiedCustomer.customerId, conversationId);
-      if (!cdata || cdata.conversationId !== conversationId || !ownedConversation) {
-        return socket.emit('call:error', { message: 'Not authorized for this conversation.' });
+      if (!parsed.success) {
+        socket.emit('call:error', { message: 'Invalid call request.' });
+        return ack?.({ ok: false, error: 'INVALID_REQUEST' });
       }
-      // Prevent duplicate active/waiting calls for this customer
+      const { conversationId } = parsed.data;
+      const bound = customers.get(socket.id);
+      const conversation = customerOwnsConversation(verifiedCustomer.customerId, conversationId);
+      if (!bound || bound.conversationId !== conversationId || !conversation) {
+        socket.emit('call:error', { message: 'Not authorized for this conversation.' });
+        return ack?.({ ok: false, error: 'FORBIDDEN' });
+      }
       const existing = get(
-        "SELECT * FROM calls WHERE customer_id = ? AND status IN ('ringing','in_queue','active') LIMIT 1",
-        [cdata.customerId]
+        "SELECT * FROM calls WHERE customer_id = ? AND status IN ('WAITING','RINGING','ACTIVE') LIMIT 1",
+        [verifiedCustomer.customerId],
       );
       if (existing) {
         socket.emit('call:error', { message: 'You already have a pending or active call.' });
-        return;
+        return ack?.({ ok: false, error: 'DUPLICATE_CALL', callId: existing.id });
       }
+      if (!['AI_ACTIVE', 'HUMAN_REQUIRED', 'HUMAN_ACTIVE'].includes(conversation.status)) {
+        socket.emit('call:error', { message: 'A call cannot be started from the current conversation state.' });
+        return ack?.({ ok: false, error: 'INVALID_CONVERSATION_STATE' });
+      }
+
       const callId = 'ca_' + nanoid(12);
-      const pos = callState.queue.length + (callState.currentCall || callState.ringing ? 1 : 0);
-      run('INSERT INTO calls (id,customer_id,conversation_id,status,queue_position,started_at) VALUES (?,?,?,?,?,?)',
-        [callId, cdata.customerId, conversationId, 'in_queue', pos, now()]);
-      run("UPDATE conversations SET status = 'WAITING_CALL', updated_at = ? WHERE id = ?", [now(), conversationId]);
-
-      const queueItem = {
-        callId,
-        customerId: cdata.customerId,
-        conversationId,
-        customerName: cdata.name || 'Customer',
-        customerSocketId: socket.id,
-        enqueuedAt: now(),
-      };
-
-      if (!callState.currentCall && !callState.ringing) {
-        // Ring immediately
-        startRinging(queueItem);
-      } else {
-        callState.queue.push(queueItem);
-        socket.emit('call:queued', { callId, position: callState.queue.length });
-        io.to('agents').emit('call:queued', {
+      const requestedAt = now();
+      const waitingCount = get("SELECT COUNT(*) AS count FROM calls WHERE status = 'WAITING'")?.count || 0;
+      run(
+        `INSERT INTO calls (
+          id, customer_id, conversation_id, status, queue_position, started_at,
+          previous_conversation_status, previous_conversation_mode, expires_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
           callId,
-          customerName: cdata.name,
-          position: callState.queue.length,
-          customer: get('SELECT name, requirement FROM customers WHERE id = ?', [cdata.customerId]),
+          verifiedCustomer.customerId,
           conversationId,
-        });
-      }
+          CALL_STATUS.WAITING,
+          waitingCount + 1,
+          requestedAt,
+          conversation.status,
+          conversation.mode,
+          requestedAt + CALL_QUEUE_TTL_MS,
+          requestedAt,
+        ],
+      );
+      run(
+        "UPDATE conversations SET status = 'WAITING_CALL', revision = revision + 1, updated_at = ? WHERE id = ?",
+        [requestedAt, conversationId],
+      );
+      emitConversationStatus(conversationId, 'WAITING_CALL');
+      socket.emit('call:queued', { callId, position: waitingCount + 1 });
+      io.to('agents').emit('call:queued', {
+        callId,
+        customerName: verifiedCustomer.name,
+        position: waitingCount + 1,
+        customer: get('SELECT name, requirement FROM customers WHERE id = ?', [verifiedCustomer.customerId]),
+        conversationId,
+      });
+      ack?.({ ok: true, callId, position: waitingCount + 1 });
+      updateQueuePositions();
       broadcastDashboard();
+      promoteNextWaitingCall();
     });
 
-    socket.on('call:hangup', ({ callId }) => {
-      // Customer ends call
-      endCall(callId, 'customer_hangup');
-    });
-
-    socket.on('call:cancel', () => {
-      // Cancel queued call
-      const entry = callState.queue.find(q => q.customerSocketId === socket.id);
-      if (entry) {
-        callState.queue = callState.queue.filter(q => q.callId !== entry.callId);
-        run("UPDATE calls SET status = 'cancelled', ended_at = ?, end_reason = 'customer_cancel', duration = 0 WHERE id = ?",
-          [now(), entry.callId]);
-        socket.emit('call:cancelled');
-        updateQueuePositions();
-        broadcastDashboard();
-        return;
+    socket.on('call:hangup', (payload, ack) => {
+      const parsed = z.object({ callId: z.string().min(1).max(100) }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const call = getCall(parsed.data.callId);
+      const peers = callRuntime.peers.get(parsed.data.callId);
+      if (!call || call.customer_id !== verifiedCustomer.customerId || call.status !== CALL_STATUS.ACTIVE || peers?.customerSocketId !== socket.id) {
+        return ack?.({ ok: false, error: 'NOT_CALL_OWNER' });
       }
-      if (callState.ringing && callState.ringing.customerSocketId === socket.id) {
-        clearTimeout(callState.ringing.timeout);
-        run("UPDATE calls SET status = 'cancelled', ended_at = ?, end_reason = 'customer_cancel' WHERE id = ?",
-          [now(), callState.ringing.callId]);
-        callState.ringing = null;
-        socket.emit('call:cancelled');
-        promoteQueueToRinging();
-        broadcastDashboard();
-      }
+      const result = completeCall(call.id, CALL_STATUS.ENDED, 'customer_hangup');
+      ack?.({ ok: result.ok, error: result.error });
     });
 
-    // WebRTC signaling (customer)
-    socket.on('webrtc:signal', ({ to, signal }) => {
-      if (callState.currentCall && callState.currentCall.customerSocketId === socket.id && to === callState.currentCall.agentSocketId) {
-        io.to(to).emit('webrtc:signal', { from: socket.id, signal });
+    socket.on('call:cancel', (_payload, ack) => {
+      const call = get(
+        "SELECT * FROM calls WHERE customer_id = ? AND status IN ('WAITING','RINGING') ORDER BY started_at DESC LIMIT 1",
+        [verifiedCustomer.customerId],
+      );
+      if (!call) return ack?.({ ok: false, error: 'NO_CANCELLABLE_CALL' });
+      const result = completeCall(call.id, CALL_STATUS.CANCELLED, 'customer_cancel', 'call:cancelled');
+      ack?.({ ok: result.ok, error: result.error });
+    });
+
+    // WebRTC signaling (customer) — active call peer only.
+    socket.on('webrtc:signal', (payload) => {
+      const parsed = z.object({ to: z.string(), signal: z.unknown() }).safeParse(payload);
+      if (!parsed.success) return;
+      const peer = [...callRuntime.peers.values()].find(value => value.customerSocketId === socket.id);
+      if (peer && parsed.data.to === peer.agentSocketId) {
+        io.to(parsed.data.to).emit('webrtc:signal', { from: socket.id, signal: parsed.data.signal });
       }
     });
 
     socket.on('disconnect', () => {
       customers.delete(socket.id);
-      // If was in a call, end it
-      if (callState.currentCall && callState.currentCall.customerSocketId === socket.id) {
-        endCall(callState.currentCall.callId, 'customer_disconnected');
+      const active = [...callRuntime.peers.entries()].find(([, peers]) => peers.customerSocketId === socket.id);
+      if (active) completeCall(active[0], CALL_STATUS.FAILED, 'customer_disconnected');
+
+      const ringing = get(
+        "SELECT * FROM calls WHERE customer_id = ? AND status = 'RINGING' ORDER BY started_at DESC LIMIT 1",
+        [verifiedCustomer.customerId],
+      );
+      if (ringing && connectedCustomerSockets(verifiedCustomer.customerId, ringing.conversation_id).length === 0) {
+        completeCall(ringing.id, CALL_STATUS.FAILED, 'customer_disconnected', 'call:ended');
       }
-      if (callState.ringing && callState.ringing.customerSocketId === socket.id) {
-        clearTimeout(callState.ringing.timeout);
-        run("UPDATE calls SET status = 'missed', ended_at = ?, end_reason = 'customer_disconnected' WHERE id = ?",
-          [now(), callState.ringing.callId]);
-        callState.ringing = null;
-        promoteQueueToRinging();
-      }
-      // Remove from queue if queued
-      const qidx = callState.queue.findIndex(q => q.customerSocketId === socket.id);
-      if (qidx >= 0) {
-        const entry = callState.queue[qidx];
-        run("UPDATE calls SET status = 'cancelled', ended_at = ?, end_reason = 'customer_disconnected' WHERE id = ?",
-          [now(), entry.callId]);
-        callState.queue.splice(qidx, 1);
-        updateQueuePositions();
-      }
+      // WAITING calls remain persisted and recover when this customer reconnects.
       broadcastDashboard();
     });
   }
 });
 
-function startRinging(queueItem) {
-  run("UPDATE calls SET status = 'ringing', queue_position = 0 WHERE id = ?", [queueItem.callId]);
-  const timeout = setTimeout(() => {
-    // Agent didn't answer in time — miss and try next
-    if (!callState.ringing) return;
-    run("UPDATE calls SET status = 'missed', ended_at = ?, end_reason = 'timeout' WHERE id = ?",
-      [now(), queueItem.callId]);
-    io.to(queueItem.customerSocketId).emit('call:rejected', { callId: queueItem.callId, reason: 'No answer' });
-    callState.ringing = null;
-    promoteQueueToRinging();
-    broadcastDashboard();
-  }, 30_000); // 30s ring timeout
-  callState.ringing = { ...queueItem, timeout };
-  const customer = get('SELECT name, requirement FROM customers WHERE id = ?', [queueItem.customerId]);
-  const msgs = all(
-    'SELECT id, sender_type as senderType, message, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
-    [queueItem.conversationId]
-  );
-  io.to('agents').emit('call:incoming', {
-    callId: queueItem.callId,
-    customer,
-    conversationId: queueItem.conversationId,
-    messages: msgs,
-  });
-  io.to(queueItem.customerSocketId).emit('call:ringing', { callId: queueItem.callId });
+function getCall(callId) {
+  return get('SELECT * FROM calls WHERE id = ?', [callId]);
 }
 
-function promoteQueueToRinging() {
-  if (callState.currentCall || callState.ringing) return;
-  const next = callState.queue.shift();
-  if (!next) return;
-  updateQueuePositions();
-  startRinging(next);
+function connectedCustomerSockets(customerId, conversationId = null) {
+  return [...customers.entries()]
+    .filter(([, customer]) => customer.customerId === customerId && (!conversationId || customer.conversationId === conversationId))
+    .map(([socketId]) => socketId);
+}
+
+function connectedCustomerSocket(customerId, conversationId) {
+  return connectedCustomerSockets(customerId, conversationId)[0] || null;
+}
+
+function emitConversationStatus(conversationId, status) {
+  for (const [socketId, customer] of customers.entries()) {
+    if (customer.conversationId === conversationId) io.to(socketId).emit('conversation:status', { status });
+  }
+}
+
+function clearRingingTimer(callId) {
+  const timer = callRuntime.ringingTimers.get(callId);
+  if (timer) clearTimeout(timer);
+  callRuntime.ringingTimers.delete(callId);
+}
+
+function transitionCall(callId, nextStatus, updates = {}) {
+  const current = getCall(callId);
+  if (!current) return { ok: false, error: 'NOT_FOUND' };
+  if (current.status === nextStatus) return { ok: true, call: current };
+  if (TERMINAL_CALL_STATUSES.has(current.status)) return { ok: false, error: 'TERMINAL', call: current };
+  if (!CALL_TRANSITIONS[current.status]?.has(nextStatus)) {
+    return { ok: false, error: `INVALID_TRANSITION_${current.status}_TO_${nextStatus}`, call: current };
+  }
+
+  const changedAt = now();
+  const next = {
+    ...current,
+    ...updates,
+    status: nextStatus,
+    updated_at: changedAt,
+  };
+  run(
+    `UPDATE calls SET status = ?, queue_position = ?, ringing_at = ?, answered_at = ?, ended_at = ?,
+       duration = ?, handled_by = ?, end_reason = ?, expires_at = ?, updated_at = ?
+     WHERE id = ?`,
+    [
+      next.status,
+      next.queue_position ?? 0,
+      next.ringing_at,
+      next.answered_at,
+      next.ended_at,
+      next.duration ?? 0,
+      next.handled_by,
+      next.end_reason,
+      next.expires_at,
+      next.updated_at,
+      callId,
+    ],
+  );
+  return { ok: true, call: getCall(callId), previousStatus: current.status };
+}
+
+function restoreConversationForCall(call) {
+  const conversation = conversationStatus(call.conversation_id);
+  if (!conversation || !['WAITING_CALL', 'IN_CALL'].includes(conversation.status)) return;
+  const validPrevious = ['AI_ACTIVE', 'HUMAN_REQUIRED', 'HUMAN_ACTIVE'].includes(call.previous_conversation_status)
+    ? call.previous_conversation_status
+    : (call.previous_conversation_mode === 'human' ? 'HUMAN_ACTIVE' : 'AI_ACTIVE');
+  const previousMode = call.previous_conversation_mode === 'human' ? 'human' : 'ai';
+  run(
+    'UPDATE conversations SET status = ?, mode = ?, revision = revision + 1, updated_at = ? WHERE id = ?',
+    [validPrevious, previousMode, now(), call.conversation_id],
+  );
+  emitConversationStatus(call.conversation_id, validPrevious);
 }
 
 function updateQueuePositions() {
-  callState.queue.forEach((q, i) => {
-    run('UPDATE calls SET queue_position = ? WHERE id = ?', [i + 1, q.callId]);
-    io.to(q.customerSocketId).emit('call:queued', { callId: q.callId, position: i + 1 });
+  const waiting = all(
+    `SELECT ca.*, cu.name AS customer_name
+     FROM calls ca JOIN customers cu ON cu.id = ca.customer_id
+     WHERE ca.status = 'WAITING'
+     ORDER BY ca.started_at ASC, ca.id ASC`,
+  );
+  waiting.forEach((call, index) => {
+    const position = index + 1;
+    if (call.queue_position !== position) {
+      run('UPDATE calls SET queue_position = ?, updated_at = ? WHERE id = ?', [position, now(), call.id]);
+    }
+    for (const socketId of connectedCustomerSockets(call.customer_id, call.conversation_id)) {
+      io.to(socketId).emit('call:queued', { callId: call.id, position });
+    }
   });
-  io.to('agents').emit('call:queue_update', callState.queue.map((q, i) => ({
-    callId: q.callId, customerName: q.customerName, position: i + 1,
+  io.to('agents').emit('call:queue_update', waiting.map((call, index) => ({
+    callId: call.id,
+    customerName: call.customer_name,
+    position: index + 1,
   })));
+  return waiting;
 }
 
-function endCall(callId, reason) {
-  const call = get('SELECT * FROM calls WHERE id = ?', [callId]);
-  if (!call) return;
-  if (call.status === 'ended' || call.status === 'rejected' || call.status === 'missed' || call.status === 'cancelled') return;
+function completeCall(callId, finalStatus, reason, customerEvent = 'call:ended', options = {}) {
+  const current = getCall(callId);
+  if (!current) return { ok: false, error: 'NOT_FOUND' };
   const endedAt = now();
-  const duration = call.answered_at ? Math.max(0, Math.round((endedAt - call.answered_at) / 1000)) : 0;
-  run("UPDATE calls SET status = 'ended', ended_at = ?, duration = ?, end_reason = ? WHERE id = ?",
-    [endedAt, duration, reason || 'ended', callId]);
-  // Restore conversation: if it was IN_CALL, go back to HUMAN_ACTIVE if an agent was assigned, else AI_ACTIVE/HUMAN_REQUIRED as before
-  const conv = get('SELECT * FROM conversations WHERE id = ?', [call.conversation_id]);
-  if (conv && conv.status === 'IN_CALL') {
-    const newStatus = conv.assigned_agent_id ? 'HUMAN_ACTIVE' : (conv.status === 'HUMAN_REQUIRED' ? 'HUMAN_REQUIRED' : 'AI_ACTIVE');
-    run('UPDATE conversations SET status = ?, updated_at = ? WHERE id = ?', [newStatus, endedAt, call.conversation_id]);
+  const duration = current.answered_at
+    ? Math.max(0, Math.round((endedAt - current.answered_at) / 1000))
+    : 0;
+  const result = transitionCall(callId, finalStatus, {
+    queue_position: 0,
+    ended_at: endedAt,
+    duration,
+    end_reason: reason,
+    expires_at: null,
+  });
+  if (!result.ok) return result;
+
+  clearRingingTimer(callId);
+  const peers = callRuntime.peers.get(callId);
+  callRuntime.peers.delete(callId);
+  restoreConversationForCall(result.call);
+
+  const payload = { callId, duration, reason, status: finalStatus };
+  for (const socketId of connectedCustomerSockets(result.call.customer_id, result.call.conversation_id)) {
+    io.to(socketId).emit(customerEvent, payload);
   }
-  if (callState.currentCall && callState.currentCall.callId === callId) {
-    io.to(callState.currentCall.customerSocketId).emit('call:ended', { callId, duration, reason });
-    io.to(callState.currentCall.agentSocketId).emit('call:ended', { callId, duration, reason });
-    callState.currentCall = null;
-    promoteQueueToRinging();
-  } else if (callState.ringing && callState.ringing.callId === callId) {
-    clearTimeout(callState.ringing.timeout);
-    io.to(callState.ringing.customerSocketId).emit('call:ended', { callId, duration: 0, reason });
-    callState.ringing = null;
-    promoteQueueToRinging();
-  } else {
-    // Was in queue
-    callState.queue = callState.queue.filter(q => q.callId !== callId);
-    updateQueuePositions();
-  }
+  if (peers?.agentSocketId) io.to(peers.agentSocketId).emit('call:ended', payload);
+  io.to('agents').emit('call:resolved', payload);
+  updateQueuePositions();
   broadcastDashboard();
+  if (options.promote !== false) promoteNextWaitingCall();
+  return result;
+}
+
+function expireWaitingCalls() {
+  const expired = all(
+    "SELECT id FROM calls WHERE status = 'WAITING' AND expires_at IS NOT NULL AND expires_at <= ?",
+    [now()],
+  );
+  for (const call of expired) {
+    completeCall(call.id, CALL_STATUS.MISSED, 'queue_expired', 'call:rejected', { promote: false });
+  }
+}
+
+function promoteNextWaitingCall() {
+  if (agents.size === 0) return updateQueuePositions();
+  const blocking = get("SELECT id FROM calls WHERE status IN ('RINGING','ACTIVE') LIMIT 1");
+  if (blocking) return updateQueuePositions();
+  expireWaitingCalls();
+
+  const waiting = updateQueuePositions();
+  const next = waiting.find(call => connectedCustomerSocket(call.customer_id, call.conversation_id));
+  if (!next) return;
+  const customerSocketId = connectedCustomerSocket(next.customer_id, next.conversation_id);
+  const transitioned = transitionCall(next.id, CALL_STATUS.RINGING, {
+    queue_position: 0,
+    ringing_at: now(),
+    expires_at: now() + CALL_RING_TIMEOUT_MS,
+  });
+  if (!transitioned.ok) return;
+
+  const timeout = setTimeout(() => {
+    const call = getCall(next.id);
+    if (call?.status === CALL_STATUS.RINGING) {
+      completeCall(next.id, CALL_STATUS.MISSED, 'ring_timeout', 'call:rejected');
+    }
+  }, CALL_RING_TIMEOUT_MS);
+  callRuntime.ringingTimers.set(next.id, timeout);
+
+  const customer = get('SELECT name, requirement FROM customers WHERE id = ?', [next.customer_id]);
+  const messages = all(
+    'SELECT id, sender_type as senderType, message, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
+    [next.conversation_id],
+  );
+  io.to('agents').emit('call:incoming', {
+    callId: next.id,
+    customer,
+    conversationId: next.conversation_id,
+    messages,
+  });
+  io.to(customerSocketId).emit('call:ringing', { callId: next.id });
+  updateQueuePositions();
+  broadcastDashboard();
+}
+
+function reconcileCallsAfterStartup() {
+  const stale = all("SELECT id FROM calls WHERE status IN ('RINGING','ACTIVE')");
+  for (const call of stale) {
+    completeCall(call.id, CALL_STATUS.FAILED, 'server_restart', 'call:ended', { promote: false });
+  }
+  expireWaitingCalls();
+  const waiting = updateQueuePositions();
+  if (stale.length || waiting.length) {
+    console.log(`[calls] Reconciled ${stale.length} stale and ${waiting.length} waiting call(s).`);
+  }
 }
 
 // =====================================================
@@ -882,6 +1080,7 @@ app.use((err, req, res, next) => {
     validateAIConfiguration();
     await initDb();
     await importKnowledgeFile();
+    reconcileCallsAfterStartup();
     server.listen(PORT, () => {
       console.log(`[server] Electricalskart Help Desk listening on port ${PORT} (${NODE_ENV})`);
     });

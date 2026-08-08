@@ -16,8 +16,8 @@ export default function CallCenter({ socket, summary, activeCall }) {
     };
   }, [socket]);
 
-  const queue = summary?.calls?.filter(c => c.status === 'in_queue') || [];
-  const current = summary?.calls?.find(c => c.status === 'active') || null;
+  const queue = summary?.calls?.filter(call => call.status === 'WAITING') || [];
+  const current = summary?.calls?.find(call => call.status === 'ACTIVE') || null;
 
   return (
     <div>
@@ -45,7 +45,7 @@ export default function CallCenter({ socket, summary, activeCall }) {
               {queue.map(q => (
                 <li key={q.id} className="flex items-center justify-between">
                   <span>#{q.queue_position}</span>
-                  <span className="text-slate-700">Customer call</span>
+                  <span className="text-slate-700 truncate px-2">{q.customer_name || 'Customer'}</span>
                   <span className="text-xs text-slate-400">{new Date(q.started_at).toLocaleTimeString()}</span>
                 </li>
               ))}
@@ -55,8 +55,8 @@ export default function CallCenter({ socket, summary, activeCall }) {
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <div className="text-xs uppercase tracking-wide text-slate-500">Stats</div>
           <div className="mt-2 text-sm">
-            <div>Total handled: <b>{history.filter(c => c.status === 'ended').length}</b></div>
-            <div>Missed/rejected: <b>{history.filter(c => ['missed','rejected','cancelled'].includes(c.status)).length}</b></div>
+            <div>Total handled: <b>{history.filter(call => call.status === 'ENDED').length}</b></div>
+            <div>Missed/rejected: <b>{history.filter(call => ['MISSED','REJECTED','FAILED','CANCELLED'].includes(call.status)).length}</b></div>
           </div>
         </div>
       </div>
@@ -97,14 +97,14 @@ export default function CallCenter({ socket, summary, activeCall }) {
 
 function CallStatusBadge({ status }) {
   const map = {
-    pending: { label: 'Pending', cls: 'bg-slate-100 text-slate-700' },
-    ringing: { label: 'Ringing', cls: 'bg-amber-100 text-amber-700' },
-    in_queue: { label: 'In queue', cls: 'bg-indigo-100 text-indigo-700' },
-    active: { label: 'Active', cls: 'bg-emerald-100 text-emerald-700' },
-    ended: { label: 'Ended', cls: 'bg-slate-200 text-slate-700' },
-    rejected: { label: 'Rejected', cls: 'bg-red-100 text-red-700' },
-    missed: { label: 'Missed', cls: 'bg-red-100 text-red-700' },
-    cancelled: { label: 'Cancelled', cls: 'bg-slate-100 text-slate-600' },
+    WAITING: { label: 'Waiting', cls: 'bg-indigo-100 text-indigo-700' },
+    RINGING: { label: 'Ringing', cls: 'bg-amber-100 text-amber-700' },
+    ACTIVE: { label: 'Active', cls: 'bg-emerald-100 text-emerald-700' },
+    ENDED: { label: 'Ended', cls: 'bg-slate-200 text-slate-700' },
+    REJECTED: { label: 'Rejected', cls: 'bg-red-100 text-red-700' },
+    MISSED: { label: 'Missed', cls: 'bg-red-100 text-red-700' },
+    FAILED: { label: 'Failed', cls: 'bg-red-100 text-red-700' },
+    CANCELLED: { label: 'Cancelled', cls: 'bg-slate-100 text-slate-600' },
   };
   const info = map[status] || { label: status, cls: 'bg-slate-100' };
   return <span className={`text-xs px-2 py-0.5 rounded-full ${info.cls}`}>{info.label}</span>;
