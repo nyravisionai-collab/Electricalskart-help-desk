@@ -3,6 +3,7 @@ import { api } from '../lib/api.js';
 import { getCustomerSocket, resetCustomerSocket } from '../lib/socket.js';
 import ChatWindow from '../components/ChatWindow.jsx';
 import CallWidget from '../components/CallWidget.jsx';
+import { DEFAULT_ICE_SERVERS } from '../lib/webrtc.js';
 
 const SESSION_KEY = 'esk_customer_session';
 const CUSTOMER_KEY = 'esk_customer';
@@ -30,6 +31,7 @@ export default function CustomerApp() {
   const [typing, setTyping] = useState(false);
   const [error, setError] = useState('');
   const [callInfo, setCallInfo] = useState(null); // { callId, state, position }
+  const [iceServers, setIceServers] = useState(DEFAULT_ICE_SERVERS);
   const socketRef = useRef(null);
 
   // Bind socket when chat starts
@@ -44,6 +46,9 @@ export default function CustomerApp() {
     sock.on('conversation:messages', (msgs) => setMessages(msgs));
     sock.on('conversation:status', ({ status: s, agentName: a }) => { setStatus(s); if (a) setAgentName(a); });
     sock.on('ai:typing', (v) => setTyping(!!v));
+    sock.on('webrtc:config', ({ iceServers: configured }) => {
+      if (Array.isArray(configured) && configured.length) setIceServers(configured);
+    });
 
     sock.on('call:ringing', ({ callId }) => {
       setCallInfo({ callId, state: 'ringing' });
@@ -70,6 +75,7 @@ export default function CustomerApp() {
       sock.off('conversation:messages');
       sock.off('conversation:status');
       sock.off('ai:typing');
+      sock.off('webrtc:config');
       sock.off('call:ringing');
       sock.off('call:queued');
       sock.off('call:accepted');
@@ -135,6 +141,12 @@ export default function CustomerApp() {
     setCallInfo(null);
   }
 
+  function failCall(reason) {
+    const sock = socketRef.current;
+    if (!sock || !callInfo?.callId) return;
+    sock.emit('call:failed', { callId: callInfo.callId, reason });
+  }
+
   function resetSession() {
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(CUSTOMER_KEY);
@@ -158,7 +170,16 @@ export default function CustomerApp() {
         <main className="flex-1 w-full max-w-3xl mx-auto flex flex-col px-3 sm:px-4 pb-4 pt-2">
           <StatusBar status={status} agentName={agentName} />
           <ChatWindow messages={messages} typing={typing} onSend={sendMessage}>
-            <CallWidget callInfo={callInfo} onStartCall={startCall} onCancel={cancelCall} onHangup={hangupCall} socket={socketRef.current} peerSocketId={callInfo?.peerSocketId} />
+            <CallWidget
+              callInfo={callInfo}
+              onStartCall={startCall}
+              onCancel={cancelCall}
+              onHangup={hangupCall}
+              onFailure={failCall}
+              socket={socketRef.current}
+              peerSocketId={callInfo?.peerSocketId}
+              iceServers={iceServers}
+            />
           </ChatWindow>
         </main>
       )}

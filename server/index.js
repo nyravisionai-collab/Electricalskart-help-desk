@@ -37,6 +37,7 @@ import {
   listKnowledgeEntries,
   saveKnowledgeEntry,
 } from './knowledge.js';
+import { buildIceServers } from './webrtc-config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -52,7 +53,7 @@ const corsOptions = configuredCorsOrigins.length > 0
 
 const app = express();
 const server = http.createServer(app);
-const io = new IOServer(server, { cors: corsOptions });
+const io = new IOServer(server, { cors: corsOptions, maxHttpBufferSize: 256 * 1024 });
 
 app.use(helmet({
   crossOriginEmbedderPolicy: false,
@@ -112,6 +113,7 @@ const CALL_TRANSITIONS = Object.freeze({
 });
 const CALL_RING_TIMEOUT_MS = Math.max(250, Number.parseInt(process.env.CALL_RING_TIMEOUT_MS || '30000', 10));
 const CALL_QUEUE_TTL_MS = Math.max(5_000, Number.parseInt(process.env.CALL_QUEUE_TTL_MS || '900000', 10));
+let configuredIceServers = [];
 const callRuntime = {
   ringingTimers: new Map(), // callId -> timeout
   peers: new Map(),         // callId -> { customerSocketId, agentSocketId }
@@ -126,6 +128,22 @@ function sanitize(s, max = 2000) {
   if (typeof s !== 'string') return '';
   return s.trim().slice(0, max);
 }
+
+const webRtcSignalSchema = z.union([
+  z.object({
+    type: z.enum(['offer', 'answer']),
+    sdp: z.string().min(1).max(200_000),
+  }).passthrough(),
+  z.object({
+    type: z.literal('candidate'),
+    candidate: z.object({
+      candidate: z.string().max(10_000),
+      sdpMid: z.string().nullable().optional(),
+      sdpMLineIndex: z.number().int().nonnegative().nullable().optional(),
+      usernameFragment: z.string().nullable().optional(),
+    }).passthrough(),
+  }).passthrough(),
+]);
 
 function conversationStatus(conversationId) {
   return get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
@@ -479,6 +497,7 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  socket.emit('webrtc:config', { iceServers: configuredIceServers });
   if (socket.data.user) {
     // ---------- AGENT ----------
     const u = socket.data.user;
@@ -637,9 +656,27 @@ io.on('connection', (socket) => {
       ack?.({ ok: result.ok, error: result.error });
     });
 
+    socket.on('call:failed', (payload, ack) => {
+      const parsed = z.object({
+        callId: z.string().min(1).max(100),
+        reason: z.string().trim().min(1).max(100),
+      }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const call = getCall(parsed.data.callId);
+      const peers = callRuntime.peers.get(parsed.data.callId);
+      if (!call || call.status !== CALL_STATUS.ACTIVE || call.handled_by !== u.uid || peers?.agentSocketId !== socket.id) {
+        return ack?.({ ok: false, error: 'NOT_CALL_OWNER' });
+      }
+      const result = completeCall(call.id, CALL_STATUS.FAILED, `webrtc_${parsed.data.reason}`);
+      ack?.({ ok: result.ok, error: result.error });
+    });
+
     // WebRTC signaling is relayed only between the two verified active-call peers.
     socket.on('webrtc:signal', (payload) => {
-      const parsed = z.object({ to: z.string(), signal: z.unknown() }).safeParse(payload);
+      const parsed = z.object({
+        to: z.string().min(1).max(100),
+        signal: webRtcSignalSchema,
+      }).safeParse(payload);
       if (!parsed.success) return;
       const peer = [...callRuntime.peers.values()].find(value => value.agentSocketId === socket.id);
       if (peer && parsed.data.to === peer.customerSocketId) {
@@ -818,6 +855,21 @@ io.on('connection', (socket) => {
       ack?.({ ok: result.ok, error: result.error });
     });
 
+    socket.on('call:failed', (payload, ack) => {
+      const parsed = z.object({
+        callId: z.string().min(1).max(100),
+        reason: z.string().trim().min(1).max(100),
+      }).safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const call = getCall(parsed.data.callId);
+      const peers = callRuntime.peers.get(parsed.data.callId);
+      if (!call || call.customer_id !== verifiedCustomer.customerId || call.status !== CALL_STATUS.ACTIVE || peers?.customerSocketId !== socket.id) {
+        return ack?.({ ok: false, error: 'NOT_CALL_OWNER' });
+      }
+      const result = completeCall(call.id, CALL_STATUS.FAILED, `webrtc_${parsed.data.reason}`);
+      ack?.({ ok: result.ok, error: result.error });
+    });
+
     socket.on('call:cancel', (_payload, ack) => {
       const call = get(
         "SELECT * FROM calls WHERE customer_id = ? AND status IN ('WAITING','RINGING') ORDER BY started_at DESC LIMIT 1",
@@ -830,7 +882,10 @@ io.on('connection', (socket) => {
 
     // WebRTC signaling (customer) — active call peer only.
     socket.on('webrtc:signal', (payload) => {
-      const parsed = z.object({ to: z.string(), signal: z.unknown() }).safeParse(payload);
+      const parsed = z.object({
+        to: z.string().min(1).max(100),
+        signal: webRtcSignalSchema,
+      }).safeParse(payload);
       if (!parsed.success) return;
       const peer = [...callRuntime.peers.values()].find(value => value.customerSocketId === socket.id);
       if (peer && parsed.data.to === peer.agentSocketId) {
@@ -1078,6 +1133,7 @@ app.use((err, req, res, next) => {
   try {
     validateAuthConfiguration();
     validateAIConfiguration();
+    configuredIceServers = buildIceServers();
     await initDb();
     await importKnowledgeFile();
     reconcileCallsAfterStartup();

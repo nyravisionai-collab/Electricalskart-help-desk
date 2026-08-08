@@ -123,9 +123,40 @@ test('accepted call ends cleanly and duplicate call is prevented', async () => {
   });
   const accepted = await emitWithAck(ownerSocket, 'call:accept', { callId: incoming.callId });
   assert.equal(accepted.ok, true);
-  await Promise.all([customerAccepted, agentAccepted]);
+  const [customerPeer, agentPeer] = await Promise.all([customerAccepted, agentAccepted]);
   assert.equal((await callRecord(incoming.callId)).status, 'ACTIVE');
   assert.equal((await conversation(entry)).status, 'IN_CALL');
+
+  const offerReceived = onceEvent(entry.socket, 'webrtc:signal', {
+    predicate: event => event.signal?.type === 'offer',
+  });
+  ownerSocket.emit('webrtc:signal', {
+    to: agentPeer.customerSocketId,
+    signal: { type: 'offer', sdp: 'v=0\r\na=audit-offer' },
+  });
+  const offer = await offerReceived;
+  assert.equal(offer.from, customerPeer.agentSocketId);
+
+  const answerReceived = onceEvent(ownerSocket, 'webrtc:signal', {
+    predicate: event => event.signal?.type === 'answer',
+  });
+  entry.socket.emit('webrtc:signal', {
+    to: offer.from,
+    signal: { type: 'answer', sdp: 'v=0\r\na=audit-answer' },
+  });
+  await answerReceived;
+
+  const candidateReceived = onceEvent(entry.socket, 'webrtc:signal', {
+    predicate: event => event.signal?.type === 'candidate',
+  });
+  ownerSocket.emit('webrtc:signal', {
+    to: agentPeer.customerSocketId,
+    signal: {
+      type: 'candidate',
+      candidate: { candidate: 'candidate:1 1 UDP 1 127.0.0.1 9999 typ host', sdpMid: '0', sdpMLineIndex: 0 },
+    },
+  });
+  await candidateReceived;
 
   const endedEvent = onceEvent(entry.socket, 'call:ended', {
     predicate: event => event.callId === incoming.callId,
@@ -134,6 +165,30 @@ test('accepted call ends cleanly and duplicate call is prevented', async () => {
   assert.equal(ended.ok, true);
   await endedEvent;
   assert.equal((await callRecord(incoming.callId)).status, 'ENDED');
+  assert.equal((await conversation(entry)).status, 'AI_ACTIVE');
+});
+
+test('WebRTC setup failure terminates the call, restores chat, and records FAILED', async () => {
+  const entry = await openCustomer('WebRTC Failure Customer');
+  const incoming = await requestRingingCall(entry);
+  const acceptedEvent = onceEvent(entry.socket, 'call:accepted', {
+    predicate: event => event.callId === incoming.callId,
+  });
+  await emitWithAck(ownerSocket, 'call:accept', { callId: incoming.callId });
+  await acceptedEvent;
+
+  const agentEnded = onceEvent(ownerSocket, 'call:ended', {
+    predicate: event => event.callId === incoming.callId && event.status === 'FAILED',
+  });
+  const failed = await emitWithAck(entry.socket, 'call:failed', {
+    callId: incoming.callId,
+    reason: 'microphone_permission',
+  });
+  assert.equal(failed.ok, true);
+  await agentEnded;
+  const record = await callRecord(incoming.callId);
+  assert.equal(record.status, 'FAILED');
+  assert.equal(record.end_reason, 'webrtc_microphone_permission');
   assert.equal((await conversation(entry)).status, 'AI_ACTIVE');
 });
 
