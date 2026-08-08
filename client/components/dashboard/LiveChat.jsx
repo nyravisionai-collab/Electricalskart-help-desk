@@ -20,7 +20,7 @@ export default function LiveChat({ socket }) {
     const onUpdate = () => load();
     socket.on('dashboard:update', onUpdate);
     socket.on('conversation:messages', (payload) => {
-      if (selected && payload.conversationId === selected.id) setMessages(payload.messages);
+      if (payload.conversationId === selected?.id) setMessages(payload.messages);
       load();
     });
     return () => {

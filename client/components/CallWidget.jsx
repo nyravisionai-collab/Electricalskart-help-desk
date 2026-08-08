@@ -42,6 +42,8 @@ export default function CallWidget({
     };
     socket.on('webrtc:signal', onSignal);
     return () => socket.off('webrtc:signal', onSignal);
+    // reportFailure intentionally reads the current call props through this render's listener.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket]);
 
   useEffect(() => {
@@ -55,6 +57,8 @@ export default function CallWidget({
     } else if (state === 'idle') {
       cleanup(true);
     }
+    // WebRTC setup is keyed only by the server-owned call state and peer id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, peerSocketId]);
 
   useEffect(() => () => cleanup(true), []);

@@ -222,9 +222,9 @@ function notify(title, body) {
 function IncomingCallModal({ call, onAccept, onReject }) {
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 ring-pulse">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
         <div className="flex items-center gap-3">
-          <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-2xl">📞</div>
+          <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-2xl ring-pulse">📞</div>
           <div>
             <div className="font-bold text-lg">Incoming Customer Call</div>
             <div className="text-slate-500 text-sm">{call.customer?.name || 'Customer'} — {call.customer?.requirement || 'Support request'}</div>
@@ -266,6 +266,8 @@ function ActiveCallPanel({ socket, call, onHangup, onFailure, setActiveCall, ice
       reportFailure(reason, startError);
     });
     return () => cleanup(true);
+    // The active-call panel is mounted once for a server-assigned call.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function startCall() {

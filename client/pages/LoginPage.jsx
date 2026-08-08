@@ -38,8 +38,9 @@ export default function LoginPage({ onLoggedIn }) {
         </div>
         <form onSubmit={submit} className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Email</label>
+            <label htmlFor="staff-email" className="block text-sm font-medium text-slate-700 mb-1">Email</label>
             <input
+              id="staff-email"
               type="email"
               autoComplete="username"
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500"
@@ -50,8 +51,9 @@ export default function LoginPage({ onLoggedIn }) {
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Password</label>
+            <label htmlFor="staff-password" className="block text-sm font-medium text-slate-700 mb-1">Password</label>
             <input
+              id="staff-password"
               type="password"
               autoComplete="current-password"
               className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-brand-500"

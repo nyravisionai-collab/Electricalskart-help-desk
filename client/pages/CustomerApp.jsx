@@ -32,6 +32,7 @@ export default function CustomerApp() {
   const [error, setError] = useState('');
   const [callInfo, setCallInfo] = useState(null); // { callId, state, position }
   const [iceServers, setIceServers] = useState(DEFAULT_ICE_SERVERS);
+  const [socket, setSocket] = useState(null);
   const socketRef = useRef(null);
 
   // Bind socket when chat starts
@@ -39,6 +40,7 @@ export default function CustomerApp() {
     if (!started || !session.customer) return;
     const sock = getCustomerSocket({ token: session.customerToken });
     socketRef.current = sock;
+    setSocket(sock);
     sock.emit('customer:bind', {
       conversationId: session.customer.conversationId,
     });
@@ -63,7 +65,7 @@ export default function CustomerApp() {
       setMessages(m => [...m, { id: 'sys'+Date.now(), senderType: 'SYSTEM', message: reason ? `Call was rejected: ${reason}` : 'Support is unavailable right now. Please try again shortly.' , timestamp: Date.now() }]);
     });
     sock.on('call:cancelled', () => setCallInfo(null));
-    sock.on('call:ended', ({ duration, reason }) => {
+    sock.on('call:ended', ({ duration }) => {
       setCallInfo(null);
       setMessages(m => [...m, { id: 'sys'+Date.now(), senderType: 'SYSTEM', message: `Call ended (${formatDuration(duration)}).`, timestamp: Date.now() }]);
     });
@@ -84,7 +86,7 @@ export default function CustomerApp() {
       sock.off('call:ended');
       sock.off('call:error');
     };
-  }, [started, session.customer?.conversationId]);
+  }, [started, session.customer, session.customerToken]);
 
   async function startChat(e) {
     e.preventDefault();
@@ -176,7 +178,7 @@ export default function CustomerApp() {
               onCancel={cancelCall}
               onHangup={hangupCall}
               onFailure={failCall}
-              socket={socketRef.current}
+              socket={socket}
               peerSocketId={callInfo?.peerSocketId}
               iceServers={iceServers}
             />
@@ -235,8 +237,9 @@ function IntroForm({ name, setName, requirement, setRequirement, onSubmit, error
         <p className="text-slate-500 mt-1 text-sm">Chat with our AI assistant, or connect with a human for personalised help.</p>
         <form onSubmit={onSubmit} className="mt-6 space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Your name</label>
+            <label htmlFor="customer-name" className="block text-sm font-medium text-slate-700 mb-1">Your name</label>
             <input
+              id="customer-name"
               value={name}
               onChange={e => setName(e.target.value)}
               className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-brand-500 focus:outline-none"
@@ -246,8 +249,9 @@ function IntroForm({ name, setName, requirement, setRequirement, onSubmit, error
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">How can we help you?</label>
+            <label htmlFor="customer-requirement" className="block text-sm font-medium text-slate-700 mb-1">How can we help you?</label>
             <textarea
+              id="customer-requirement"
               value={requirement}
               onChange={e => setRequirement(e.target.value)}
               rows={3}
