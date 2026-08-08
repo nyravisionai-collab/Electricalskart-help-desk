@@ -3,7 +3,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import CustomerApp from './pages/CustomerApp.jsx';
 import LoginPage from './pages/LoginPage.jsx';
 import Dashboard from './pages/Dashboard.jsx';
-import { getToken, getUser, clearAuth } from './lib/auth.js';
+import { getToken, getUser, clearAuth, clearPrivateCaches } from './lib/auth.js';
 
 function ProtectedRoute({ children }) {
   const token = getToken();
@@ -15,6 +15,8 @@ function ProtectedRoute({ children }) {
 export default function App() {
   const [, setTick] = useState(0);
   useEffect(() => {
+    // Remove private API caches created by pre-M9 service workers.
+    void clearPrivateCaches();
     // Ensure PWA service worker is registered
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
