@@ -150,10 +150,11 @@ function pushMessagesToConversation(conversationId) {
   io.to('agents').emit('conversation:messages', { conversationId, messages: msgs });
 }
 
-async function generateAIResponseAndPersist(conversationId, customerId) {
-  // Don't auto-reply if a human is already handling
+async function generateAIResponseAndPersist(conversationId, expectedRevision) {
+  // Every generation is tied to the exact AI-active revision that requested it.
+  // A takeover, close, call transition, or newer customer message invalidates it.
   const conv = conversationStatus(conversationId);
-  if (!conv || ['HUMAN_ACTIVE', 'CLOSED'].includes(conv.status)) return;
+  if (!conv || conv.status !== 'AI_ACTIVE' || conv.revision !== expectedRevision) return;
 
   const msgs = all(
     "SELECT sender_type, message FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC",
@@ -178,6 +179,11 @@ async function generateAIResponseAndPersist(conversationId, customerId) {
 
   if (customerSid) io.to(customerSid).emit('ai:typing', false);
 
+  // Human mode and newer conversation revisions are authoritative. Discard a
+  // response that completed after its initiating revision was invalidated.
+  const current = conversationStatus(conversationId);
+  if (!current || current.status !== 'AI_ACTIVE' || current.revision !== expectedRevision) return;
+
   // Persist AI message if non-empty
   if (text) {
     const id = 'm_' + nanoid(12);
@@ -187,8 +193,8 @@ async function generateAIResponseAndPersist(conversationId, customerId) {
   }
 
   if (needsHuman) {
-    run("UPDATE conversations SET status = 'HUMAN_REQUIRED', updated_at = ? WHERE id = ? AND status = 'AI_ACTIVE'",
-      [now(), conversationId]);
+    run("UPDATE conversations SET status = 'HUMAN_REQUIRED', revision = revision + 1, updated_at = ? WHERE id = ? AND status = 'AI_ACTIVE' AND revision = ?",
+      [now(), conversationId, expectedRevision]);
     const sysId = 'm_' + nanoid(12);
     run('INSERT INTO messages (id, conversation_id, sender_type, sender_id, message, timestamp) VALUES (?,?,?,?,?,?)',
       [sysId, conversationId, 'SYSTEM', null, 'Connecting you to a support representative…', now()]);
@@ -329,7 +335,7 @@ app.post('/api/customer/start', (req, res) => {
         [reqId, id, 'CUSTOMER', customer.id, customer.requirement, now()]);
     }
     convo = get('SELECT * FROM conversations WHERE id = ?', [id]);
-    setTimeout(() => generateAIResponseAndPersist(id, customer.id), 400);
+    setTimeout(() => generateAIResponseAndPersist(id, convo.revision), 400);
   }
 
   res.json({
@@ -457,7 +463,7 @@ io.on('connection', (socket) => {
     socket.on('conversation:takeover', ({ conversationId }) => {
       const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
       if (!conv) return;
-      run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, updated_at = ? WHERE id = ?",
+      run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
         [u.uid, now(), conversationId]);
       const sysId = 'm_' + nanoid(12);
       run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
@@ -473,7 +479,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('conversation:close', ({ conversationId }) => {
-      run("UPDATE conversations SET status = 'CLOSED', updated_at = ? WHERE id = ?", [now(), conversationId]);
+      run("UPDATE conversations SET status = 'CLOSED', revision = revision + 1, updated_at = ? WHERE id = ?", [now(), conversationId]);
       const sysId = 'm_' + nanoid(12);
       run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
         [sysId, conversationId, 'SYSTEM', u.uid, 'Conversation closed by agent.', now()]);
@@ -492,8 +498,8 @@ io.on('connection', (socket) => {
       const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
       if (!conv) return;
       // If in AI mode, auto-takeover on first agent message
-      if (conv.status !== 'HUMAN_ACTIVE' && conv.status !== 'HUMAN_REQUIRED') {
-        run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, updated_at = ? WHERE id = ?",
+      if (conv.status !== 'HUMAN_ACTIVE') {
+        run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
           [u.uid, now(), conversationId]);
       } else {
         run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now(), conversationId]);
@@ -642,7 +648,8 @@ io.on('connection', (socket) => {
 
       const text = sanitize(message);
       run('UPDATE customers SET last_active_at = ? WHERE id = ?', [now(), verifiedCustomer.customerId]);
-      run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now(), conversationId]);
+      run('UPDATE conversations SET revision = revision + 1, updated_at = ? WHERE id = ?', [now(), conversationId]);
+      const updatedConversation = conversationStatus(conversationId);
       const id = 'm_' + nanoid(12);
       run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
         [id, conversationId, 'CUSTOMER', verifiedCustomer.customerId, text, now()]);
@@ -650,8 +657,11 @@ io.on('connection', (socket) => {
       broadcastDashboard();
       ack?.({ ok: true, messageId: id });
 
-      if (conv.status === 'AI_ACTIVE') {
-        setTimeout(() => generateAIResponseAndPersist(conversationId, verifiedCustomer.customerId), 100);
+      if (updatedConversation?.status === 'AI_ACTIVE') {
+        setTimeout(
+          () => generateAIResponseAndPersist(conversationId, updatedConversation.revision),
+          100,
+        );
       }
     });
 

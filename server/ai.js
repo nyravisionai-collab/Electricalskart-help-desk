@@ -35,6 +35,10 @@ function renderVerifiedFacts(entries) {
  * The deterministic renderer intentionally avoids model-created business facts.
  */
 export async function generateReply(messages, verifiedEntries = []) {
+  if (process.env.NODE_ENV === 'test') {
+    const delay = Number.parseInt(process.env.AI_RESPONSE_DELAY_MS || '0', 10);
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, Math.min(delay, 5_000)));
+  }
   const question = lastCustomerMessage(messages);
   if (isGreetingOnly(question)) {
     return {

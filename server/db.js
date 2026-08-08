@@ -63,10 +63,15 @@ async function initDb() {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       assigned_agent_id TEXT,
+      revision INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(customer_id) REFERENCES customers(id),
       FOREIGN KEY(assigned_agent_id) REFERENCES users(id)
     );
   `);
+  const conversationColumns = db.exec('PRAGMA table_info(conversations)')[0]?.values.map(row => row[1]) || [];
+  if (!conversationColumns.includes('revision')) {
+    db.run('ALTER TABLE conversations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;');
+  }
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
