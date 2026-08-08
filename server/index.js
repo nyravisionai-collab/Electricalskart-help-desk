@@ -29,6 +29,14 @@ import {
   hashCustomerSessionToken,
 } from './customer-auth.js';
 import { generateReply, suggestReply } from './ai.js';
+import { validateAIConfiguration } from './ai-provider.js';
+import {
+  findVerifiedKnowledge,
+  importKnowledgeFile,
+  knowledgeEntrySchema,
+  listKnowledgeEntries,
+  saveKnowledgeEntry,
+} from './knowledge.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -164,7 +172,9 @@ async function generateAIResponseAndPersist(conversationId, customerId) {
   const customerSid = [...customers.entries()].find(([, c]) => c.conversationId === conversationId)?.[0];
   if (customerSid) io.to(customerSid).emit('ai:typing', true);
 
-  const { text, needsHuman } = await generateReply(chatHistory);
+  const lastQuestion = [...chatHistory].reverse().find(message => message.role === 'user')?.content || '';
+  const verifiedKnowledge = findVerifiedKnowledge(lastQuestion);
+  const { text, needsHuman } = await generateReply(chatHistory, verifiedKnowledge);
 
   if (customerSid) io.to(customerSid).emit('ai:typing', false);
 
@@ -240,6 +250,29 @@ app.post('/api/agents', requireAuth, requireRole('owner'), (req, res) => {
 app.get('/api/agents', requireAuth, requireRole('owner'), (req, res) => {
   const rows = all('SELECT id, name, email, role, status, created_at FROM users ORDER BY created_at ASC');
   res.json({ agents: rows });
+});
+
+// Verified business knowledge. Agents may read the facts they support from;
+// only the Owner can create, update, activate, or deactivate entries.
+app.get('/api/knowledge', requireAuth, (req, res) => {
+  res.json({ entries: listKnowledgeEntries() });
+});
+
+app.post('/api/knowledge', requireAuth, requireRole('owner'), (req, res) => {
+  const parsed = knowledgeEntrySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid verified knowledge entry' });
+  const entry = saveKnowledgeEntry(parsed.data, req.user.uid);
+  return res.status(parsed.data.id ? 200 : 201).json({ entry });
+});
+
+app.delete('/api/knowledge/:id', requireAuth, requireRole('owner'), (req, res) => {
+  const existing = get('SELECT id FROM knowledge_entries WHERE id = ?', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Knowledge entry not found' });
+  run(
+    'UPDATE knowledge_entries SET is_active = 0, updated_at = ?, updated_by = ? WHERE id = ?',
+    [now(), req.user.uid, req.params.id],
+  );
+  return res.status(204).end();
 });
 
 // =====================================================
@@ -484,7 +517,8 @@ io.on('connection', (socket) => {
               m.sender_type === 'SYSTEM' ? 'system' : 'assistant',
         content: m.message,
       }));
-      const suggestion = await suggestReply(history);
+      const lastQuestion = [...history].reverse().find(message => message.role === 'user')?.content || '';
+      const suggestion = await suggestReply(history, findVerifiedKnowledge(lastQuestion));
       if (ack) ack({ suggestion }); else socket.emit('agent:suggestion', { conversationId, suggestion });
     });
 
@@ -835,7 +869,9 @@ app.use((err, req, res, next) => {
 (async () => {
   try {
     validateAuthConfiguration();
+    validateAIConfiguration();
     await initDb();
+    await importKnowledgeFile();
     server.listen(PORT, () => {
       console.log(`[server] Electricalskart Help Desk listening on port ${PORT} (${NODE_ENV})`);
     });

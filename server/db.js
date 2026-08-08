@@ -96,6 +96,21 @@ async function initDb() {
       FOREIGN KEY(handled_by) REFERENCES users(id)
     );
   `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS knowledge_entries (
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      keywords TEXT NOT NULL DEFAULT '[]',
+      source TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      verified_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      updated_by TEXT,
+      FOREIGN KEY(updated_by) REFERENCES users(id)
+    );
+  `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, timestamp);`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_calls_status ON calls(status);`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);`);
