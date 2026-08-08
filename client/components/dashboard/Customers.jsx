@@ -88,7 +88,7 @@ export default function Customers() {
                         <li key={c.id} className="border border-slate-100 rounded-lg p-2">
                           <div className="flex items-center justify-between">
                             <span className="text-xs text-slate-500">{new Date(c.started_at).toLocaleString()}</span>
-                            <span className={`text-xs px-2 py-0.5 rounded-full ${c.status === 'ended' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700'}`}>{c.status}</span>
+                            <span className={`text-xs px-2 py-0.5 rounded-full ${c.status === 'ENDED' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700'}`}>{c.status}</span>
                           </div>
                           <div className="text-slate-700 mt-1">Duration {c.duration ? Math.floor(c.duration/60)+':'+String(c.duration%60).padStart(2,'0') : '—'} • {c.end_reason || 'completed'}</div>
                         </li>

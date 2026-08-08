@@ -3,20 +3,20 @@ import { api } from '../lib/api.js';
 import { getCustomerSocket, resetCustomerSocket } from '../lib/socket.js';
 import ChatWindow from '../components/ChatWindow.jsx';
 import CallWidget from '../components/CallWidget.jsx';
+import { DEFAULT_ICE_SERVERS } from '../lib/webrtc.js';
 
-const SESSION_KEY = 'esk_session';
+const SESSION_KEY = 'esk_customer_session';
 const CUSTOMER_KEY = 'esk_customer';
 
 function loadStored() {
   try {
-    const s = localStorage.getItem(SESSION_KEY);
-    const c = localStorage.getItem(CUSTOMER_KEY);
-    return {
-      sessionId: s || '',
-      customer: c ? JSON.parse(c) : null,
-    };
+    const token = localStorage.getItem(SESSION_KEY);
+    const rawCustomer = localStorage.getItem(CUSTOMER_KEY);
+    const customer = rawCustomer ? JSON.parse(rawCustomer) : null;
+    if (!token || !customer?.conversationId) return { customerToken: '', customer: null };
+    return { customerToken: token, customer };
   } catch {
-    return { sessionId: '', customer: null };
+    return { customerToken: '', customer: null };
   }
 }
 
@@ -31,27 +31,26 @@ export default function CustomerApp() {
   const [typing, setTyping] = useState(false);
   const [error, setError] = useState('');
   const [callInfo, setCallInfo] = useState(null); // { callId, state, position }
+  const [iceServers, setIceServers] = useState(DEFAULT_ICE_SERVERS);
+  const [socket, setSocket] = useState(null);
   const socketRef = useRef(null);
 
   // Bind socket when chat starts
   useEffect(() => {
     if (!started || !session.customer) return;
-    const sock = getCustomerSocket({
-      customerId: session.customer.customerId,
-      conversationId: session.customer.conversationId,
-      name: session.customer.name,
-      sessionId: session.sessionId,
-    });
+    const sock = getCustomerSocket({ token: session.customerToken });
     socketRef.current = sock;
+    setSocket(sock);
     sock.emit('customer:bind', {
-      customerId: session.customer.customerId,
       conversationId: session.customer.conversationId,
-      name: session.customer.name,
     });
 
     sock.on('conversation:messages', (msgs) => setMessages(msgs));
     sock.on('conversation:status', ({ status: s, agentName: a }) => { setStatus(s); if (a) setAgentName(a); });
     sock.on('ai:typing', (v) => setTyping(!!v));
+    sock.on('webrtc:config', ({ iceServers: configured }) => {
+      if (Array.isArray(configured) && configured.length) setIceServers(configured);
+    });
 
     sock.on('call:ringing', ({ callId }) => {
       setCallInfo({ callId, state: 'ringing' });
@@ -66,7 +65,7 @@ export default function CustomerApp() {
       setMessages(m => [...m, { id: 'sys'+Date.now(), senderType: 'SYSTEM', message: reason ? `Call was rejected: ${reason}` : 'Support is unavailable right now. Please try again shortly.' , timestamp: Date.now() }]);
     });
     sock.on('call:cancelled', () => setCallInfo(null));
-    sock.on('call:ended', ({ duration, reason }) => {
+    sock.on('call:ended', ({ duration }) => {
       setCallInfo(null);
       setMessages(m => [...m, { id: 'sys'+Date.now(), senderType: 'SYSTEM', message: `Call ended (${formatDuration(duration)}).`, timestamp: Date.now() }]);
     });
@@ -78,6 +77,7 @@ export default function CustomerApp() {
       sock.off('conversation:messages');
       sock.off('conversation:status');
       sock.off('ai:typing');
+      sock.off('webrtc:config');
       sock.off('call:ringing');
       sock.off('call:queued');
       sock.off('call:accepted');
@@ -86,7 +86,7 @@ export default function CustomerApp() {
       sock.off('call:ended');
       sock.off('call:error');
     };
-  }, [started, session.customer?.conversationId]);
+  }, [started, session.customer, session.customerToken]);
 
   async function startChat(e) {
     e.preventDefault();
@@ -95,15 +95,17 @@ export default function CustomerApp() {
       const res = await api.post('/api/customer/start', {
         name: name.trim(),
         requirement: requirement.trim(),
-        sessionId: session.sessionId || undefined,
+        customerToken: session.customerToken || undefined,
       });
-      localStorage.setItem(SESSION_KEY, res.sessionId);
+      localStorage.setItem(SESSION_KEY, res.customerToken);
       localStorage.setItem(CUSTOMER_KEY, JSON.stringify({
-        customerId: res.customerId,
         conversationId: res.conversationId,
-        name: name.trim(),
+        name: res.customerName || name.trim(),
       }));
-      setSession({ sessionId: res.sessionId, customer: { customerId: res.customerId, conversationId: res.conversationId, name: name.trim() } });
+      setSession({
+        customerToken: res.customerToken,
+        customer: { conversationId: res.conversationId, name: res.customerName || name.trim() },
+      });
       setStarted(true);
       setStatus(res.status);
     } catch (e) {
@@ -141,6 +143,12 @@ export default function CustomerApp() {
     setCallInfo(null);
   }
 
+  function failCall(reason) {
+    const sock = socketRef.current;
+    if (!sock || !callInfo?.callId) return;
+    sock.emit('call:failed', { callId: callInfo.callId, reason });
+  }
+
   function resetSession() {
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(CUSTOMER_KEY);
@@ -151,7 +159,7 @@ export default function CustomerApp() {
     setMessages([]);
     setStatus('AI_ACTIVE');
     setAgentName(null);
-    setSession({ sessionId: '', customer: null });
+    setSession({ customerToken: '', customer: null });
     setCallInfo(null);
   }
 
@@ -164,7 +172,16 @@ export default function CustomerApp() {
         <main className="flex-1 w-full max-w-3xl mx-auto flex flex-col px-3 sm:px-4 pb-4 pt-2">
           <StatusBar status={status} agentName={agentName} />
           <ChatWindow messages={messages} typing={typing} onSend={sendMessage}>
-            <CallWidget callInfo={callInfo} onStartCall={startCall} onCancel={cancelCall} onHangup={hangupCall} socket={socketRef.current} peerSocketId={callInfo?.peerSocketId} />
+            <CallWidget
+              callInfo={callInfo}
+              onStartCall={startCall}
+              onCancel={cancelCall}
+              onHangup={hangupCall}
+              onFailure={failCall}
+              socket={socket}
+              peerSocketId={callInfo?.peerSocketId}
+              iceServers={iceServers}
+            />
           </ChatWindow>
         </main>
       )}
@@ -220,8 +237,9 @@ function IntroForm({ name, setName, requirement, setRequirement, onSubmit, error
         <p className="text-slate-500 mt-1 text-sm">Chat with our AI assistant, or connect with a human for personalised help.</p>
         <form onSubmit={onSubmit} className="mt-6 space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">Your name</label>
+            <label htmlFor="customer-name" className="block text-sm font-medium text-slate-700 mb-1">Your name</label>
             <input
+              id="customer-name"
               value={name}
               onChange={e => setName(e.target.value)}
               className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-brand-500 focus:outline-none"
@@ -231,8 +249,9 @@ function IntroForm({ name, setName, requirement, setRequirement, onSubmit, error
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">How can we help you?</label>
+            <label htmlFor="customer-requirement" className="block text-sm font-medium text-slate-700 mb-1">How can we help you?</label>
             <textarea
+              id="customer-requirement"
               value={requirement}
               onChange={e => setRequirement(e.target.value)}
               rows={3}

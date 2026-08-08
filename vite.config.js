@@ -24,13 +24,9 @@ export default defineConfig({
       },
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,png,ico,webp}'],
-        runtimeCaching: [
-          {
-            urlPattern: ({ url }) => url.pathname.startsWith('/api'),
-            handler: 'NetworkFirst',
-            options: { cacheName: 'api-cache' },
-          },
-        ],
+        cleanupOutdatedCaches: true,
+        // Authenticated/customer API responses are deliberately never runtime-cached.
+        navigateFallbackDenylist: [/^\/api\//, /^\/socket\.io\//],
       },
     }),
   ],

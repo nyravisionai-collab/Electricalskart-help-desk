@@ -22,4 +22,17 @@ export function getUser() {
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(USER_KEY);
+  void clearPrivateCaches();
+}
+
+// Removes cache names used by older releases that cached /api responses.
+// Current service workers cache static build assets only.
+export async function clearPrivateCaches() {
+  if (!('caches' in globalThis)) return;
+  const names = await globalThis.caches.keys();
+  await Promise.all(
+    names
+      .filter(name => name === 'api-cache' || name.startsWith('private-api-'))
+      .map(name => globalThis.caches.delete(name)),
+  );
 }

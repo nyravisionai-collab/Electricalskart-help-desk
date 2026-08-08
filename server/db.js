@@ -40,11 +40,20 @@ async function initDb() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       session_id TEXT NOT NULL UNIQUE,
+      session_token_hash TEXT,
       requirement TEXT,
       created_at INTEGER NOT NULL,
       last_active_at INTEGER NOT NULL
     );
   `);
+  // Existing prototype databases predate authenticated customer sessions.
+  // Keep their records, but require those customers to start a fresh verified
+  // session before they can access a conversation again.
+  const customerColumns = db.exec('PRAGMA table_info(customers)')[0]?.values.map(row => row[1]) || [];
+  if (!customerColumns.includes('session_token_hash')) {
+    db.run('ALTER TABLE customers ADD COLUMN session_token_hash TEXT;');
+  }
+  db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_session_token ON customers(session_token_hash);');
   db.run(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
@@ -54,10 +63,15 @@ async function initDb() {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       assigned_agent_id TEXT,
+      revision INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(customer_id) REFERENCES customers(id),
       FOREIGN KEY(assigned_agent_id) REFERENCES users(id)
     );
   `);
+  const conversationColumns = db.exec('PRAGMA table_info(conversations)')[0]?.values.map(row => row[1]) || [];
+  if (!conversationColumns.includes('revision')) {
+    db.run('ALTER TABLE conversations ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;');
+  }
   db.run(`
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
@@ -69,22 +83,92 @@ async function initDb() {
       FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
     );
   `);
-  db.run(`
-    CREATE TABLE IF NOT EXISTS calls (
+  const createCallsTable = tableName => `
+    CREATE TABLE ${tableName} (
       id TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
       conversation_id TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ringing','in_queue','active','ended','rejected','missed','cancelled')),
-      queue_position INTEGER DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'WAITING'
+        CHECK(status IN ('WAITING','RINGING','ACTIVE','REJECTED','CANCELLED','ENDED','FAILED','MISSED')),
+      queue_position INTEGER NOT NULL DEFAULT 0,
       started_at INTEGER NOT NULL,
+      ringing_at INTEGER,
       answered_at INTEGER,
       ended_at INTEGER,
-      duration INTEGER DEFAULT 0,
+      duration INTEGER NOT NULL DEFAULT 0,
       handled_by TEXT,
       end_reason TEXT,
+      previous_conversation_status TEXT NOT NULL,
+      previous_conversation_mode TEXT NOT NULL,
+      expires_at INTEGER,
+      updated_at INTEGER NOT NULL,
       FOREIGN KEY(customer_id) REFERENCES customers(id),
       FOREIGN KEY(conversation_id) REFERENCES conversations(id),
       FOREIGN KEY(handled_by) REFERENCES users(id)
+    );
+  `;
+  const callsTable = db.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'calls'")[0];
+  if (!callsTable) {
+    db.run(createCallsTable('calls'));
+  } else {
+    const callColumns = db.exec('PRAGMA table_info(calls)')[0]?.values.map(row => row[1]) || [];
+    const callsSql = String(callsTable.values[0]?.[0] || '');
+    const needsCallMigration = !callColumns.includes('previous_conversation_status') || callsSql.includes("'pending'");
+    if (needsCallMigration) {
+      db.run('PRAGMA foreign_keys = OFF;');
+      db.run('DROP TABLE IF EXISTS calls_m9;');
+      db.run(createCallsTable('calls_m9'));
+      db.run(`
+        INSERT INTO calls_m9 (
+          id, customer_id, conversation_id, status, queue_position, started_at,
+          ringing_at, answered_at, ended_at, duration, handled_by, end_reason,
+          previous_conversation_status, previous_conversation_mode, expires_at, updated_at
+        )
+        SELECT
+          ca.id, ca.customer_id, ca.conversation_id,
+          CASE ca.status
+            WHEN 'pending' THEN 'WAITING'
+            WHEN 'in_queue' THEN 'WAITING'
+            WHEN 'ringing' THEN 'RINGING'
+            WHEN 'active' THEN 'ACTIVE'
+            WHEN 'ended' THEN 'ENDED'
+            WHEN 'rejected' THEN 'REJECTED'
+            WHEN 'missed' THEN 'MISSED'
+            WHEN 'cancelled' THEN 'CANCELLED'
+            ELSE 'FAILED'
+          END,
+          COALESCE(ca.queue_position, 0), ca.started_at,
+          CASE WHEN ca.status = 'ringing' THEN ca.started_at ELSE NULL END,
+          ca.answered_at, ca.ended_at, COALESCE(ca.duration, 0), ca.handled_by, ca.end_reason,
+          CASE
+            WHEN co.status IN ('AI_ACTIVE','HUMAN_REQUIRED','HUMAN_ACTIVE') THEN co.status
+            WHEN co.assigned_agent_id IS NOT NULL THEN 'HUMAN_ACTIVE'
+            ELSE 'AI_ACTIVE'
+          END,
+          CASE WHEN co.mode = 'human' THEN 'human' ELSE 'ai' END,
+          ca.started_at + 900000,
+          COALESCE(ca.ended_at, ca.answered_at, ca.started_at)
+        FROM calls ca
+        JOIN conversations co ON co.id = ca.conversation_id;
+      `);
+      db.run('DROP TABLE calls;');
+      db.run('ALTER TABLE calls_m9 RENAME TO calls;');
+      db.run('PRAGMA foreign_keys = ON;');
+    }
+  }
+  db.run(`
+    CREATE TABLE IF NOT EXISTS knowledge_entries (
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      keywords TEXT NOT NULL DEFAULT '[]',
+      source TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      verified_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      updated_by TEXT,
+      FOREIGN KEY(updated_by) REFERENCES users(id)
     );
   `);
   db.run(`CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, timestamp);`);
@@ -92,20 +176,27 @@ async function initDb() {
   db.run(`CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_customers_last ON customers(last_active_at);`);
 
-  // Bootstrap owner account if no users exist
+  // Bootstrap the first Owner only from explicitly configured credentials.
+  // There are no default passwords, and credentials are never written to logs.
   const userCount = db.exec('SELECT COUNT(*) AS c FROM users')[0]?.values[0]?.[0] || 0;
   if (userCount === 0) {
     const { nanoid } = await import('nanoid');
-    const name = process.env.OWNER_NAME || 'Owner';
-    const email = (process.env.OWNER_EMAIL || 'owner@electricalskart.local').toLowerCase();
-    const password = process.env.OWNER_PASSWORD || 'ChangeThisPassword!';
-    const hash = bcrypt.hashSync(password, 10);
+    const name = (process.env.OWNER_NAME || '').trim();
+    const email = (process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    const password = process.env.OWNER_PASSWORD || '';
+    if (!name || !email || !email.includes('@')) {
+      throw new Error('OWNER_NAME and a valid OWNER_EMAIL are required to bootstrap the first Owner account.');
+    }
+    if (password.length < 12 || password.length > 128) {
+      throw new Error('OWNER_PASSWORD must be explicitly configured with 12 to 128 characters for first startup.');
+    }
+    const hash = bcrypt.hashSync(password, 12);
     const id = 'u_' + nanoid(12);
-    const now = Date.now();
+    const createdAt = Date.now();
     const stmt = db.prepare('INSERT INTO users (id,name,email,password_hash,role,status,created_at) VALUES (?,?,?,?,?,?,?)');
-    stmt.run([id, name, email, hash, 'owner', 'active', now]);
+    stmt.run([id, name, email, hash, 'owner', 'active', createdAt]);
     stmt.free();
-    console.log(`[db] Bootstrapped owner account: ${email} / ${password}  (CHANGE THIS PASSWORD)`);
+    console.log(`[db] Bootstrapped Owner account for ${email}.`);
   }
 
   persist();
@@ -127,7 +218,7 @@ function run(sql, params = []) {
   try {
     stmt.run(cleaned);
   } catch (e) {
-    console.error('[db] SQL error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] SQL error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();
@@ -143,7 +234,7 @@ function get(sql, params = []) {
     if (!stmt.step()) return null;
     return stmt.getAsObject();
   } catch (e) {
-    console.error('[db] GET error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] GET error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();
@@ -161,7 +252,7 @@ function all(sql, params = []) {
     }
     return rows;
   } catch (e) {
-    console.error('[db] ALL error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] ALL error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();

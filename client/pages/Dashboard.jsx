@@ -3,6 +3,7 @@ import { NavLink, Route, Routes, Navigate, useNavigate } from 'react-router-dom'
 import { api } from '../lib/api.js';
 import { getAgentSocket, resetAgentSocket } from '../lib/socket.js';
 import { clearAuth, getUser } from '../lib/auth.js';
+import { createIceCandidateBuffer, DEFAULT_ICE_SERVERS, safeIceServers } from '../lib/webrtc.js';
 import Overview from '../components/dashboard/Overview.jsx';
 import LiveChat from '../components/dashboard/LiveChat.jsx';
 import CallCenter from '../components/dashboard/CallCenter.jsx';
@@ -17,6 +18,7 @@ export default function Dashboard({ onLogout }) {
   const [queue, setQueue] = useState([]);
   const [activeCall, setActiveCall] = useState(null);
   const [agentsOnline, setAgentsOnline] = useState([]);
+  const [iceServers, setIceServers] = useState(DEFAULT_ICE_SERVERS);
   const [user] = useState(getUser());
   const incomingRef = useRef(null);
   const callSoundRef = useRef(null);
@@ -31,6 +33,9 @@ export default function Dashboard({ onLogout }) {
     });
     sock.on('dashboard:update', (s) => setSummary(s));
     sock.on('agents:presence', (list) => setAgentsOnline(list));
+    sock.on('webrtc:config', ({ iceServers: configured }) => {
+      if (Array.isArray(configured) && configured.length) setIceServers(configured);
+    });
     sock.on('call:incoming', (info) => {
       setIncomingCall(info);
       incomingRef.current = info;
@@ -44,8 +49,18 @@ export default function Dashboard({ onLogout }) {
     });
     sock.on('call:queue_update', (q) => setQueue(q));
     sock.on('call:accepted', ({ callId, customerSocketId }) => {
+      setActiveCall({ callId, peerSocketId: customerSocketId });
+      setIncomingCall(null);
+      incomingRef.current = null;
+    });
+    sock.on('call:taken', ({ callId }) => {
       if (incomingRef.current?.callId === callId) {
-        setActiveCall({ callId, peerSocketId: customerSocketId });
+        setIncomingCall(null);
+        incomingRef.current = null;
+      }
+    });
+    sock.on('call:resolved', ({ callId }) => {
+      if (incomingRef.current?.callId === callId) {
         setIncomingCall(null);
         incomingRef.current = null;
       }
@@ -69,9 +84,12 @@ export default function Dashboard({ onLogout }) {
       sock.off('call:incoming');
       sock.off('call:queue_update');
       sock.off('call:accepted');
+      sock.off('call:taken');
+      sock.off('call:resolved');
       sock.off('call:rejected');
       sock.off('call:ended');
       sock.off('agents:presence');
+      sock.off('webrtc:config');
       sock.off('alert:human_required');
     };
   }, []);
@@ -88,6 +106,11 @@ export default function Dashboard({ onLogout }) {
   function hangupCall() {
     if (!activeCall || !socket) return;
     socket.emit('call:hangup', { callId: activeCall.callId });
+  }
+
+  function failCall(reason) {
+    if (!activeCall || !socket) return;
+    socket.emit('call:failed', { callId: activeCall.callId, reason });
   }
 
   function logout() {
@@ -161,7 +184,14 @@ export default function Dashboard({ onLogout }) {
 
       {/* Active call overlay */}
       {activeCall && (
-        <ActiveCallPanel socket={socket} call={activeCall} incomingCall={incomingCall} onHangup={hangupCall} setActiveCall={setActiveCall} />
+        <ActiveCallPanel
+          socket={socket}
+          call={activeCall}
+          onHangup={hangupCall}
+          onFailure={failCall}
+          setActiveCall={setActiveCall}
+          iceServers={iceServers}
+        />
       )}
 
       <audio ref={callSoundRef} src="data:audio/wav;base64,UklGRlQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YTAAAAAA" preload="auto" />
@@ -192,9 +222,9 @@ function notify(title, body) {
 function IncomingCallModal({ call, onAccept, onReject }) {
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6 ring-pulse">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
         <div className="flex items-center gap-3">
-          <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-2xl">📞</div>
+          <div className="w-14 h-14 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-2xl ring-pulse">📞</div>
           <div>
             <div className="font-bold text-lg">Incoming Customer Call</div>
             <div className="text-slate-500 text-sm">{call.customer?.name || 'Customer'} — {call.customer?.requirement || 'Support request'}</div>
@@ -216,7 +246,7 @@ function IncomingCallModal({ call, onAccept, onReject }) {
   );
 }
 
-function ActiveCallPanel({ socket, call, onHangup, setActiveCall }) {
+function ActiveCallPanel({ socket, call, onHangup, onFailure, setActiveCall, iceServers }) {
   const [muted, setMuted] = useState(false);
   const [duration, setDuration] = useState(0);
   const [status, setStatus] = useState('connecting');
@@ -225,89 +255,129 @@ function ActiveCallPanel({ socket, call, onHangup, setActiveCall }) {
   const localStreamRef = useRef(null);
   const audioRef = useRef(null);
   const timerRef = useRef(null);
+  const disconnectTimerRef = useRef(null);
+  const failedRef = useRef(false);
+  const intentionalCloseRef = useRef(false);
+  const generationRef = useRef(0);
 
   useEffect(() => {
-    startCall().catch(e => setError(e.message));
-    return () => cleanup();
+    startCall().catch(startError => {
+      const reason = startError?.name === 'NotAllowedError' ? 'microphone_permission' : 'setup_failed';
+      reportFailure(reason, startError);
+    });
+    return () => cleanup(true);
+    // The active-call panel is mounted once for a server-assigned call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function startCall() {
     setError('');
+    const generation = ++generationRef.current;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    if (generation !== generationRef.current) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
     localStreamRef.current = stream;
 
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ],
-    });
+    const pc = new RTCPeerConnection({ iceServers: safeIceServers(iceServers) });
     pcRef.current = pc;
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    const candidateBuffer = createIceCandidateBuffer(pc);
+    pcRef.current.__candidateBuffer = candidateBuffer;
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-    pc.ontrack = (ev) => {
-      if (audioRef.current && ev.streams[0]) audioRef.current.srcObject = ev.streams[0];
+    pc.ontrack = event => {
+      if (audioRef.current && event.streams?.[0]) audioRef.current.srcObject = event.streams[0];
     };
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        socket.emit('webrtc:signal', { to: call.peerSocketId, signal: { candidate: ev.candidate.toJSON(), type: 'candidate' } });
+    pc.onicecandidate = event => {
+      if (event.candidate) {
+        socket.emit('webrtc:signal', {
+          to: call.peerSocketId,
+          signal: { candidate: event.candidate.toJSON(), type: 'candidate' },
+        });
       }
     };
-    pc.onconnectionstatechange = () => {
-      setStatus(pc.connectionState);
-      if (pc.connectionState === 'connected') {
-        if (timerRef.current) clearInterval(timerRef.current);
-        timerRef.current = setInterval(() => setDuration(d => d + 1), 1000);
-      }
-      if (['failed', 'closed'].includes(pc.connectionState)) {
-        onHangup();
-      }
-    };
+    pc.onconnectionstatechange = () => handleConnectionState(pc.connectionState);
 
-    // Signaling
     const onSignal = async ({ from, signal }) => {
+      if (from !== call.peerSocketId || pc.signalingState === 'closed') return;
       try {
         if (signal.type === 'answer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(signal));
-        } else if (signal.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(signal));
+          await pc.setRemoteDescription(signal);
+          await candidateBuffer.flush();
+        } else if (signal.type === 'offer') {
+          await pc.setRemoteDescription(signal);
+          await candidateBuffer.flush();
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('webrtc:signal', { to: from, signal: pc.localDescription });
+        } else if (signal.type === 'candidate' && signal.candidate) {
+          await candidateBuffer.add(signal.candidate);
         }
-      } catch (e) {
-        console.warn('[webrtc agent] signal err', e);
+      } catch (signalError) {
+        reportFailure('signaling_failed', signalError);
       }
     };
     socket.on('webrtc:signal', onSignal);
+    pcRef.current.__cleanupSignals = () => socket.off('webrtc:signal', onSignal);
 
-    // Create offer
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('webrtc:signal', { to: call.peerSocketId, signal: pc.localDescription });
-
-    // Expose cleanup for socket off
-    pcRef.current.__cleanupSignals = () => socket.off('webrtc:signal', onSignal);
   }
 
-  function cleanup() {
-    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  function handleConnectionState(nextState) {
+    setStatus(nextState);
+    if (nextState === 'connected') {
+      if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+      disconnectTimerRef.current = null;
+      if (!timerRef.current) timerRef.current = setInterval(() => setDuration(value => value + 1), 1000);
+      return;
+    }
+    if (nextState === 'disconnected') {
+      if (!disconnectTimerRef.current) {
+        disconnectTimerRef.current = setTimeout(() => reportFailure('connection_disconnected'), 8_000);
+      }
+      return;
+    }
+    if (nextState === 'failed') reportFailure('connection_failed');
+    if (nextState === 'closed' && !intentionalCloseRef.current) reportFailure('connection_closed');
+  }
+
+  function reportFailure(reason, failure) {
+    if (failedRef.current || intentionalCloseRef.current) return;
+    failedRef.current = true;
+    setError(failure?.message || 'The browser call could not be established.');
+    cleanup(false);
+    onFailure?.(reason);
+  }
+
+  function cleanup(intentional = true) {
+    generationRef.current += 1;
+    if (intentional) intentionalCloseRef.current = true;
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+    timerRef.current = null;
+    disconnectTimerRef.current = null;
     if (pcRef.current) {
       try { pcRef.current.__cleanupSignals?.(); } catch {}
+      pcRef.current.__candidateBuffer?.clear();
       try { pcRef.current.close(); } catch {}
       pcRef.current = null;
     }
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current.getTracks().forEach(track => track.stop());
       localStreamRef.current = null;
     }
     if (audioRef.current) audioRef.current.srcObject = null;
-    setActiveCall(null);
+    if (intentional) setActiveCall(null);
   }
 
   function toggleMute() {
     if (!localStreamRef.current) return;
-    const m = !muted;
-    localStreamRef.current.getAudioTracks().forEach(t => (t.enabled = !m));
-    setMuted(m);
+    const nextMuted = !muted;
+    localStreamRef.current.getAudioTracks().forEach(track => { track.enabled = !nextMuted; });
+    setMuted(nextMuted);
   }
 
   return (
@@ -318,14 +388,14 @@ function ActiveCallPanel({ socket, call, onHangup, setActiveCall }) {
         <div className="flex-1 min-w-0">
           <div className="font-semibold">Active Call</div>
           <div className="text-xs text-slate-500">
-            {status === 'connected' ? `Connected — ${fmtDur(duration)}` : status === 'connecting' || status === 'checking' ? 'Connecting…' : status}
+            {status === 'connected' ? `Connected — ${fmtDur(duration)}` : status === 'disconnected' ? 'Reconnecting…' : status === 'connecting' || status === 'checking' ? 'Connecting…' : status}
           </div>
           {error && <div className="text-xs text-red-600 mt-0.5">{error}</div>}
         </div>
       </div>
       <div className="mt-3 flex gap-2">
         <button onClick={toggleMute} className="flex-1 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-sm font-medium">{muted ? 'Unmute' : 'Mute'}</button>
-        <button onClick={() => { cleanup(); onHangup(); }} className="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-semibold">End call</button>
+        <button onClick={() => { cleanup(true); onHangup(); }} className="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-semibold">End call</button>
       </div>
     </div>
   );
