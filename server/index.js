@@ -144,6 +144,10 @@ const webRtcSignalSchema = z.union([
     }).passthrough(),
   }).passthrough(),
 ]);
+const conversationEventSchema = z.object({ conversationId: z.string().min(1).max(100) });
+const agentMessageSchema = conversationEventSchema.extend({
+  message: z.string().trim().min(1).max(2000),
+});
 
 function conversationStatus(conversationId) {
   return get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
@@ -202,6 +206,17 @@ function pushMessagesToConversation(conversationId) {
   }
   // Send to all agents (they may have it open)
   io.to('agents').emit('conversation:messages', { conversationId, messages: msgs });
+}
+
+function scheduleAIResponse(conversationId, expectedRevision, delayMs) {
+  setTimeout(() => {
+    generateAIResponseAndPersist(conversationId, expectedRevision).catch(error => {
+      console.error(`[ai] Response generation failed: ${error.message}`);
+      for (const [socketId, customer] of customers.entries()) {
+        if (customer.conversationId === conversationId) io.to(socketId).emit('ai:typing', false);
+      }
+    });
+  }, delayMs);
 }
 
 async function generateAIResponseAndPersist(conversationId, expectedRevision) {
@@ -389,7 +404,7 @@ app.post('/api/customer/start', (req, res) => {
         [reqId, id, 'CUSTOMER', customer.id, customer.requirement, now()]);
     }
     convo = get('SELECT * FROM conversations WHERE id = ?', [id]);
-    setTimeout(() => generateAIResponseAndPersist(id, convo.revision), 400);
+    scheduleAIResponse(id, convo.revision, 400);
   }
 
   res.json({
@@ -498,6 +513,23 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   socket.emit('webrtc:config', { iceServers: configuredIceServers });
+
+  // Bound every authenticated realtime connection. This protects AI/provider
+  // usage and signaling from unbounded event floods without trusting clients.
+  let eventWindowStartedAt = now();
+  let eventCount = 0;
+  const eventLimit = socket.data.user ? 300 : 120;
+  socket.use((_packet, next) => {
+    const timestamp = now();
+    if (timestamp - eventWindowStartedAt >= 60_000) {
+      eventWindowStartedAt = timestamp;
+      eventCount = 0;
+    }
+    eventCount += 1;
+    if (eventCount > eventLimit) return next(new Error('Realtime rate limit exceeded'));
+    return next();
+  });
+
   if (socket.data.user) {
     // ---------- AGENT ----------
     const u = socket.data.user;
@@ -508,88 +540,140 @@ io.on('connection', (socket) => {
     io.to('agents').emit('agents:presence', [...agents.values()]);
     promoteNextWaitingCall();
 
-    socket.on('conversation:open', ({ conversationId }) => {
-      const msgs = all(
+    socket.on('conversation:open', (payload, ack) => {
+      const parsed = conversationEventSchema.safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { conversationId } = parsed.data;
+      if (!conversationStatus(conversationId)) return ack?.({ ok: false, error: 'NOT_FOUND' });
+      const messages = all(
         'SELECT id, sender_type as senderType, sender_id as senderId, message, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
-        [conversationId]
+        [conversationId],
       );
-      socket.emit('conversation:messages', { conversationId, messages: msgs });
+      socket.emit('conversation:messages', { conversationId, messages });
+      return ack?.({ ok: true });
     });
 
-    socket.on('conversation:takeover', ({ conversationId }) => {
-      const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
-      if (!conv) return;
+    socket.on('conversation:takeover', (payload, ack) => {
+      const parsed = conversationEventSchema.safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { conversationId } = parsed.data;
+      const conversation = conversationStatus(conversationId);
+      if (!conversation) return ack?.({ ok: false, error: 'NOT_FOUND' });
+      if (conversation.status === 'CLOSED') return ack?.({ ok: false, error: 'CONVERSATION_CLOSED' });
+      if (conversation.status === 'HUMAN_ACTIVE' && conversation.assigned_agent_id === u.uid) {
+        return ack?.({ ok: true, alreadyAssigned: true });
+      }
       run(
         "UPDATE calls SET previous_conversation_status = 'HUMAN_ACTIVE', previous_conversation_mode = 'human', updated_at = ? WHERE conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE')",
         [now(), conversationId],
       );
-      run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
-        [u.uid, now(), conversationId]);
-      const sysId = 'm_' + nanoid(12);
-      run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
-        [sysId, conversationId, 'SYSTEM', u.uid, `${u.name} has joined the chat.`, now()]);
-      // Notify customer
-      for (const [sid, c] of customers.entries()) {
-        if (c.conversationId === conversationId) {
-          io.to(sid).emit('conversation:status', { status: 'HUMAN_ACTIVE', agentName: u.name });
+      run(
+        "UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+        [u.uid, now(), conversationId],
+      );
+      const systemMessageId = 'm_' + nanoid(12);
+      run(
+        'INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
+        [systemMessageId, conversationId, 'SYSTEM', u.uid, `${u.name} has joined the chat.`, now()],
+      );
+      for (const [socketId, customer] of customers.entries()) {
+        if (customer.conversationId === conversationId) {
+          io.to(socketId).emit('conversation:status', { status: 'HUMAN_ACTIVE', agentName: u.name });
         }
       }
       pushMessagesToConversation(conversationId);
       broadcastDashboard();
+      return ack?.({ ok: true });
     });
 
-    socket.on('conversation:close', ({ conversationId }) => {
-      run("UPDATE conversations SET status = 'CLOSED', revision = revision + 1, updated_at = ? WHERE id = ?", [now(), conversationId]);
-      const sysId = 'm_' + nanoid(12);
-      run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
-        [sysId, conversationId, 'SYSTEM', u.uid, 'Conversation closed by agent.', now()]);
-      for (const [sid, c] of customers.entries()) {
-        if (c.conversationId === conversationId) {
-          io.to(sid).emit('conversation:status', { status: 'CLOSED' });
+    socket.on('conversation:close', (payload, ack) => {
+      const parsed = conversationEventSchema.safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { conversationId } = parsed.data;
+      const conversation = conversationStatus(conversationId);
+      if (!conversation) return ack?.({ ok: false, error: 'NOT_FOUND' });
+      if (conversation.status === 'CLOSED') return ack?.({ ok: true, alreadyClosed: true });
+      const openCall = get(
+        "SELECT id FROM calls WHERE conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE') LIMIT 1",
+        [conversationId],
+      );
+      if (openCall) return ack?.({ ok: false, error: 'CALL_IN_PROGRESS' });
+      run(
+        "UPDATE conversations SET status = 'CLOSED', revision = revision + 1, updated_at = ? WHERE id = ?",
+        [now(), conversationId],
+      );
+      const systemMessageId = 'm_' + nanoid(12);
+      run(
+        'INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
+        [systemMessageId, conversationId, 'SYSTEM', u.uid, 'Conversation closed by agent.', now()],
+      );
+      for (const [socketId, customer] of customers.entries()) {
+        if (customer.conversationId === conversationId) {
+          io.to(socketId).emit('conversation:status', { status: 'CLOSED' });
         }
       }
       pushMessagesToConversation(conversationId);
       broadcastDashboard();
+      return ack?.({ ok: true });
     });
 
-    socket.on('agent:message', async ({ conversationId, message }) => {
-      const text = sanitize(message);
-      if (!text) return;
-      const conv = get('SELECT * FROM conversations WHERE id = ?', [conversationId]);
-      if (!conv) return;
-      // If in AI mode, auto-takeover on first agent message
-      if (conv.status !== 'HUMAN_ACTIVE') {
+    socket.on('agent:message', (payload, ack) => {
+      const parsed = agentMessageSchema.safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { conversationId, message } = parsed.data;
+      const conversation = conversationStatus(conversationId);
+      if (!conversation) return ack?.({ ok: false, error: 'NOT_FOUND' });
+      if (conversation.status === 'CLOSED') return ack?.({ ok: false, error: 'CONVERSATION_CLOSED' });
+      if (conversation.status !== 'HUMAN_ACTIVE') {
         run(
           "UPDATE calls SET previous_conversation_status = 'HUMAN_ACTIVE', previous_conversation_mode = 'human', updated_at = ? WHERE conversation_id = ? AND status IN ('WAITING','RINGING','ACTIVE')",
           [now(), conversationId],
         );
-        run("UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
-          [u.uid, now(), conversationId]);
+        run(
+          "UPDATE conversations SET status = 'HUMAN_ACTIVE', mode = 'human', assigned_agent_id = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
+          [u.uid, now(), conversationId],
+        );
       } else {
         run('UPDATE conversations SET updated_at = ? WHERE id = ?', [now(), conversationId]);
       }
-      const id = 'm_' + nanoid(12);
-      run('INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
-        [id, conversationId, 'AGENT', u.uid, text, now()]);
-      for (const [sid, c] of customers.entries()) {
-        if (c.conversationId === conversationId) {
-          io.to(sid).emit('conversation:status', { status: 'HUMAN_ACTIVE', agentName: u.name });
+      const messageId = 'm_' + nanoid(12);
+      run(
+        'INSERT INTO messages (id,conversation_id,sender_type,sender_id,message,timestamp) VALUES (?,?,?,?,?,?)',
+        [messageId, conversationId, 'AGENT', u.uid, sanitize(message), now()],
+      );
+      for (const [socketId, customer] of customers.entries()) {
+        if (customer.conversationId === conversationId) {
+          io.to(socketId).emit('conversation:status', { status: 'HUMAN_ACTIVE', agentName: u.name });
         }
       }
       pushMessagesToConversation(conversationId);
       broadcastDashboard();
+      return ack?.({ ok: true, messageId });
     });
 
-    socket.on('agent:suggest', async ({ conversationId }, ack) => {
-      const msgs = all('SELECT sender_type, message FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC', [conversationId]);
-      const history = msgs.map(m => ({
-        role: m.sender_type === 'CUSTOMER' ? 'user' :
-              m.sender_type === 'SYSTEM' ? 'system' : 'assistant',
-        content: m.message,
-      }));
-      const lastQuestion = [...history].reverse().find(message => message.role === 'user')?.content || '';
-      const suggestion = await suggestReply(history, findVerifiedKnowledge(lastQuestion));
-      if (ack) ack({ suggestion }); else socket.emit('agent:suggestion', { conversationId, suggestion });
+    socket.on('agent:suggest', async (payload, ack) => {
+      const parsed = conversationEventSchema.safeParse(payload);
+      if (!parsed.success) return ack?.({ ok: false, error: 'INVALID_REQUEST' });
+      const { conversationId } = parsed.data;
+      if (!conversationStatus(conversationId)) return ack?.({ ok: false, error: 'NOT_FOUND' });
+      try {
+        const messages = all(
+          'SELECT sender_type, message FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC',
+          [conversationId],
+        );
+        const history = messages.map(message => ({
+          role: message.sender_type === 'CUSTOMER' ? 'user' :
+                message.sender_type === 'SYSTEM' ? 'system' : 'assistant',
+          content: message.message,
+        }));
+        const lastQuestion = [...history].reverse().find(message => message.role === 'user')?.content || '';
+        const suggestion = await suggestReply(history, findVerifiedKnowledge(lastQuestion));
+        if (ack) return ack({ ok: true, suggestion });
+        return socket.emit('agent:suggestion', { conversationId, suggestion });
+      } catch (error) {
+        console.error(`[ai] Suggestion failed: ${error.message}`);
+        return ack?.({ ok: false, error: 'SUGGESTION_FAILED' });
+      }
     });
 
     // ---------- Call handling (agent side) ----------
@@ -769,10 +853,7 @@ io.on('connection', (socket) => {
       ack?.({ ok: true, messageId: id });
 
       if (updatedConversation?.status === 'AI_ACTIVE') {
-        setTimeout(
-          () => generateAIResponseAndPersist(conversationId, updatedConversation.revision),
-          100,
-        );
+        scheduleAIResponse(conversationId, updatedConversation.revision, 100);
       }
     });
 

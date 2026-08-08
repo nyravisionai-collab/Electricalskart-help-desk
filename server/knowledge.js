@@ -14,6 +14,11 @@ const knowledgeEntrySchema = z.object({
   active: z.boolean().default(true),
 });
 
+const stopWords = new Set([
+  'a', 'an', 'and', 'are', 'can', 'do', 'for', 'from', 'help', 'i', 'in', 'is',
+  'it', 'me', 'my', 'of', 'on', 'please', 'the', 'to', 'we', 'what', 'with', 'you', 'your',
+]);
+
 const intentGroups = [
   ['price', 'pricing', 'cost', 'quote'],
   ['stock', 'availability', 'available'],
@@ -30,7 +35,7 @@ function normalizeWords(value) {
     String(value || '')
       .toLowerCase()
       .match(/[a-z0-9]+/g)
-      ?.filter(word => word.length > 1) || [],
+      ?.filter(word => word.length > 1 && !stopWords.has(word)) || [],
   );
 }
 
@@ -116,7 +121,7 @@ export function findVerifiedKnowledge(question, limit = 5) {
       }
       return { entry, score };
     })
-    .filter(result => result.score > 0)
+    .filter(result => result.score >= 3)
     .sort((left, right) => right.score - left.score)
     .slice(0, limit)
     .map(result => result.entry);

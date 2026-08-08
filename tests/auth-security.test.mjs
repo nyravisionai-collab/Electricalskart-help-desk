@@ -6,7 +6,10 @@ import { after, before, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 import {
   apiRequest,
+  connectSocket,
   createTestDirectory,
+  emitWithAck,
+  onceEvent,
   startCustomer,
   startTestServer,
 } from './helpers/server.mjs';
@@ -110,6 +113,21 @@ test('Agent cannot access Owner-only API and token role claims do not override d
   );
   const forgedForbidden = await apiRequest(server.baseUrl, '/api/agents', { token: forgedRoleToken });
   assert.equal(forgedForbidden.status, 403);
+});
+
+test('malformed authenticated socket events are rejected without crashing the server', async () => {
+  const socket = connectSocket(server.baseUrl, { role: 'agent', token: ownerLogin.data.token });
+  await onceEvent(socket, 'connect');
+  const takeover = await emitWithAck(socket, 'conversation:takeover', null);
+  const message = await emitWithAck(socket, 'agent:message', { conversationId: 42, message: null });
+  const suggestion = await emitWithAck(socket, 'agent:suggest', undefined);
+  assert.equal(takeover.ok, false);
+  assert.equal(message.ok, false);
+  assert.equal(suggestion.ok, false);
+  socket.close();
+
+  const health = await apiRequest(server.baseUrl, '/api/dashboard/summary', { token: ownerLogin.data.token });
+  assert.equal(health.status, 200);
 });
 
 test('production startup fails clearly when JWT_SECRET is missing', async () => {
