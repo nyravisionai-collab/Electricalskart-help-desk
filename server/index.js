@@ -4,6 +4,7 @@ import http from 'node:http';
 import { Server as IOServer } from 'socket.io';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,15 @@ import { nanoid } from 'nanoid';
 import { z } from 'zod';
 
 import { initDb, run, get, all } from './db.js';
-import { signToken, verifyToken, comparePassword, requireAuth, requireRole, hashPassword } from './auth.js';
+import {
+  authenticateStaffToken,
+  comparePassword,
+  hashPassword,
+  requireAuth,
+  requireRole,
+  signToken,
+  validateAuthConfiguration,
+} from './auth.js';
 import {
   authenticateCustomerSession,
   createCustomerSessionToken,
@@ -26,15 +35,37 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
 const PORT = parseInt(process.env.PORT || '3001', 10);
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const CLIENT_ORIGIN = process.env.CORS_ORIGIN || (NODE_ENV === 'production' ? true : 'http://localhost:5173');
+const configuredCorsOrigins = (
+  process.env.CORS_ORIGIN || (NODE_ENV === 'development' ? 'http://localhost:5173' : '')
+).split(',').map(origin => origin.trim()).filter(Boolean);
+const corsOptions = configuredCorsOrigins.length > 0
+  ? { origin: configuredCorsOrigins, credentials: false }
+  : { origin: false };
 
 const app = express();
 const server = http.createServer(app);
-const io = new IOServer(server, {
-  cors: CLIENT_ORIGIN === true ? { origin: true, credentials: true } : { origin: CLIENT_ORIGIN, credentials: true },
-});
+const io = new IOServer(server, { cors: corsOptions });
 
-app.use(cors({ origin: CLIENT_ORIGIN === true ? true : CLIENT_ORIGIN, credentials: true }));
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: NODE_ENV === 'production' ? {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc: ["'self'", 'data:', 'https://fonts.gstatic.com'],
+      imgSrc: ["'self'", 'data:', 'blob:'],
+      mediaSrc: ["'self'", 'blob:'],
+      connectSrc: ["'self'", 'ws:', 'wss:'],
+      workerSrc: ["'self'", 'blob:'],
+    },
+  } : false,
+}));
+app.use(cors(corsOptions));
+app.use('/api/', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 app.use(express.json({ limit: '64kb' }));
 app.use(cookieParser());
 app.set('trust proxy', 1);
@@ -167,7 +198,10 @@ async function generateAIResponseAndPersist(conversationId, customerId) {
 // Auth REST
 // =====================================================
 app.post('/api/auth/login', (req, res) => {
-  const schema = z.object({ email: z.string().email(), password: z.string().min(1) });
+  const schema = z.object({
+    email: z.string().trim().email().max(254),
+    password: z.string().min(1).max(128),
+  });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid request' });
   const { email, password } = parsed.data;
@@ -187,7 +221,11 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 
 // Owner: create additional agent accounts
 app.post('/api/agents', requireAuth, requireRole('owner'), (req, res) => {
-  const schema = z.object({ name: z.string().min(1), email: z.string().email(), password: z.string().min(6) });
+  const schema = z.object({
+    name: z.string().trim().min(1).max(80),
+    email: z.string().trim().email().max(254),
+    password: z.string().min(12).max(128),
+  });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid input' });
   const { name, email, password } = parsed.data;
@@ -277,9 +315,9 @@ app.get('/api/conversations/:id/messages', (req, res) => {
   if (!conv) return res.status(404).json({ error: 'Not found' });
 
   const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  const staff = bearer ? verifyToken(bearer) : null;
+  const staff = bearer ? authenticateStaffToken(bearer) : null;
   const customer = authenticateCustomerSession(customerTokenFromRequest(req));
-  const staffAllowed = staff && ['owner', 'agent'].includes(staff.role);
+  const staffAllowed = Boolean(staff);
   const customerAllowed = customer && conv.customer_id === customer.id;
   if (!staffAllowed && !customerAllowed) {
     return res.status(customer || staff ? 403 : 401).json({ error: 'Not authorized for this conversation' });
@@ -347,9 +385,9 @@ io.use((socket, next) => {
   const role = socket.handshake.auth?.role; // 'agent' or 'customer'
   if (role === 'agent') {
     if (!token) return next(new Error('Authentication required'));
-    const payload = verifyToken(token);
-    if (!payload || !['owner', 'agent'].includes(payload.role)) return next(new Error('Invalid token'));
-    socket.data.user = payload;
+    const user = authenticateStaffToken(token);
+    if (!user) return next(new Error('Invalid token'));
+    socket.data.user = user;
     return next();
   }
   if (role === 'customer') {
@@ -795,8 +833,14 @@ app.use((err, req, res, next) => {
 
 // Start
 (async () => {
-  await initDb();
-  server.listen(PORT, () => {
-    console.log(`[server] Electricalskart Help Desk listening on http://localhost:${PORT} (${NODE_ENV})`);
-  });
+  try {
+    validateAuthConfiguration();
+    await initDb();
+    server.listen(PORT, () => {
+      console.log(`[server] Electricalskart Help Desk listening on port ${PORT} (${NODE_ENV})`);
+    });
+  } catch (error) {
+    console.error(`[startup] Configuration error: ${error.message}`);
+    process.exitCode = 1;
+  }
 })();

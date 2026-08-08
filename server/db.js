@@ -101,20 +101,27 @@ async function initDb() {
   db.run(`CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_customers_last ON customers(last_active_at);`);
 
-  // Bootstrap owner account if no users exist
+  // Bootstrap the first Owner only from explicitly configured credentials.
+  // There are no default passwords, and credentials are never written to logs.
   const userCount = db.exec('SELECT COUNT(*) AS c FROM users')[0]?.values[0]?.[0] || 0;
   if (userCount === 0) {
     const { nanoid } = await import('nanoid');
-    const name = process.env.OWNER_NAME || 'Owner';
-    const email = (process.env.OWNER_EMAIL || 'owner@electricalskart.local').toLowerCase();
-    const password = process.env.OWNER_PASSWORD || 'ChangeThisPassword!';
-    const hash = bcrypt.hashSync(password, 10);
+    const name = (process.env.OWNER_NAME || '').trim();
+    const email = (process.env.OWNER_EMAIL || '').trim().toLowerCase();
+    const password = process.env.OWNER_PASSWORD || '';
+    if (!name || !email || !email.includes('@')) {
+      throw new Error('OWNER_NAME and a valid OWNER_EMAIL are required to bootstrap the first Owner account.');
+    }
+    if (password.length < 12 || password.length > 128) {
+      throw new Error('OWNER_PASSWORD must be explicitly configured with 12 to 128 characters for first startup.');
+    }
+    const hash = bcrypt.hashSync(password, 12);
     const id = 'u_' + nanoid(12);
-    const now = Date.now();
+    const createdAt = Date.now();
     const stmt = db.prepare('INSERT INTO users (id,name,email,password_hash,role,status,created_at) VALUES (?,?,?,?,?,?,?)');
-    stmt.run([id, name, email, hash, 'owner', 'active', now]);
+    stmt.run([id, name, email, hash, 'owner', 'active', createdAt]);
     stmt.free();
-    console.log(`[db] Bootstrapped owner account: ${email} / ${password}  (CHANGE THIS PASSWORD)`);
+    console.log(`[db] Bootstrapped Owner account for ${email}.`);
   }
 
   persist();
@@ -136,7 +143,7 @@ function run(sql, params = []) {
   try {
     stmt.run(cleaned);
   } catch (e) {
-    console.error('[db] SQL error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] SQL error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();
@@ -152,7 +159,7 @@ function get(sql, params = []) {
     if (!stmt.step()) return null;
     return stmt.getAsObject();
   } catch (e) {
-    console.error('[db] GET error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] GET error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();
@@ -170,7 +177,7 @@ function all(sql, params = []) {
     }
     return rows;
   } catch (e) {
-    console.error('[db] ALL error:', e.message, '\n  SQL:', sql, '\n  params:', JSON.stringify(cleaned));
+    console.error('[db] ALL error:', e.message, '\n  SQL:', sql, `\n  parameter count: ${cleaned.length}`);
     throw e;
   } finally {
     stmt.free();
