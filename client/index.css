@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html, body, #root { height: 100%; }
+body { font-family: 'Inter', ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+
+/* Chat bubble tail */
+.bubble-customer {
+  @apply bg-brand-600 text-white rounded-2xl rounded-br-sm;
+}
+.bubble-ai {
+  @apply bg-white text-slate-800 border border-slate-200 rounded-2xl rounded-bl-sm shadow-sm;
+}
+.bubble-agent {
+  @apply bg-emerald-600 text-white rounded-2xl rounded-bl-sm;
+}
+.bubble-system {
+  @apply text-center text-xs text-slate-500 italic py-1;
+}
+
+.scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+
+/* Ringing pulse */
+@keyframes ring {
+  0%,100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.15); opacity: .8; }
+}
+.ring-pulse { animation: ring 0.9s ease-in-out infinite; }
+
+/* Status dot */
+.dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
